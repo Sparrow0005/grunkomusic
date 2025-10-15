@@ -291,7 +291,7 @@ process.on('uncaughtException', handleCriticalError);
 // Catch Discord client errors
 client.on('error', handleCriticalError);
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
   // Notify every guild that we just restarted
   client.guilds.cache.forEach(guild => {
