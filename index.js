@@ -31,6 +31,7 @@ client.on('messageCreate', async (message) => {
   const args = message.content.slice(prefix.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
+  // Play command
   if (command === 'play' || command === 'p') {
     if (!message.member.voice.channel) {
       return message.reply('You need to be in a voice channel to play music!');
@@ -77,6 +78,7 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // Skip command
   if (command === 'skip' || command === 's') {
     const serverQueue = queue.get(message.guild.id);
     if (!serverQueue) {
@@ -88,6 +90,7 @@ client.on('messageCreate', async (message) => {
     console.log('Skipping song...');
   }
 
+  // Leave command
   if (command === 'leave' || command === 'l') {
     const serverQueue = queue.get(message.guild.id);
     if (serverQueue) {
@@ -101,6 +104,7 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // Help command
   if (command === 'help' || command === 'h') {
     message.reply(
       "**Commands List:**\n" +
@@ -114,8 +118,32 @@ client.on('messageCreate', async (message) => {
     );
     console.log(`Help command was used`);
   }
+
+  // Queue command
+  if (command === 'queue' || command === 'q') {
+    const serverQueue = queue.get(message.guild.id);
+    if (!serverQueue || serverQueue.songs.length === 0) {
+      return message.reply('The queue is currently empty.');
+    }
+
+    let queueList = 'Current Queue:\n';
+    serverQueue.songs.forEach((song, index) => {
+      queueList += `${index + 1}. ${song.title}\n`;
+    });
+
+    message.reply(queueList);
+  }
+
+  // Now playing command
+  if (command === 'playing' || command === 'np') {
+    if (!currentPlaying) {
+      return message.reply('No song is currently playing.');
+    }
+    message.reply(`🎶 Now playing: **${currentPlaying}**`);
+  }
 });
 
+// Play next song in the queue
 const playNextInQueue = async (guildId) => {
   const serverQueue = queue.get(guildId);
   if (!serverQueue || serverQueue.songs.length === 0) {
@@ -157,6 +185,7 @@ const playNextInQueue = async (guildId) => {
   }
 };
 
+// Fetch song title using yt-dlp
 const fetchSongTitle = (url) => {
   return new Promise((resolve, reject) => {
     console.log(`Fetching song title for: ${url}`);
@@ -185,6 +214,7 @@ const fetchSongTitle = (url) => {
   });
 };
 
+// Fetch song URL using yt-dlp
 const fetchSongUrl = (url) => {
   return new Promise((resolve, reject) => {
     console.log(`Fetching song URL for: ${url}`);
@@ -214,6 +244,7 @@ const fetchSongUrl = (url) => {
   });
 };
 
+// Inactivity timer logic
 const startInactivityTimeout = (guildId) => {
   if (inactivityTimeouts.has(guildId)) return;
   inactivityTimeouts.set(
@@ -229,6 +260,7 @@ const startInactivityTimeout = (guildId) => {
   );
 };
 
+// Clear inactivity timeout
 const clearInactivityTimeout = (guildId) => {
   const timeout = inactivityTimeouts.get(guildId);
   if (timeout) {
