@@ -1,0 +1,11 @@
+# Ignore sensitive files
+token.txt
+cookies.txt
+
+# Node.js specific files
+node_modules/
+npm-debug.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
