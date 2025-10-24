@@ -153,10 +153,21 @@ const playNextInQueue = async (guildId) => {
   }
 
   const song = serverQueue.songs.shift();
+  console.log(`Playing next song: ${song.title}`);
 
   try {
     const audioUrl = await fetchSongUrl(song.url);
+    console.log(`Fetched audio URL: ${audioUrl}`);
+
+    if (!audioUrl) {
+      console.error('Failed to fetch a valid audio URL');
+      throw new Error('Invalid audio URL');
+    }
+
     const resource = createAudioResource(audioUrl);
+    console.log('Created audio resource:', resource);
+
+    // Play the resource and subscribe to the player
     serverQueue.player.play(resource);
     serverQueue.connection.subscribe(serverQueue.player);
     serverQueue.playing = true;
@@ -168,7 +179,7 @@ const playNextInQueue = async (guildId) => {
     }, PLAYBACK_COOLDOWN);
 
     serverQueue.player.on(AudioPlayerStatus.Idle, () => {
-      console.log('Song finished, playing next in queue.');
+      console.log('Audio player is idle. Song finished.');
       serverQueue.playing = false;
       playNextInQueue(guildId);
     });
@@ -188,15 +199,16 @@ const playNextInQueue = async (guildId) => {
 // Fetch song title using yt-dlp
 const fetchSongTitle = (url) => {
   return new Promise((resolve, reject) => {
-    console.log(`Fetching song title for: ${url}`);
+    console.log(`Fetching song title for URL: ${url}`);
     const ytDlpProcess = spawn('yt-dlp', [
       '--get-title',
-      '--cookies', config.cookiesFilePath,  // Use cookies path from config
+      '--cookies', config.cookiesFilePath,  // Ensure the correct cookies path
       url
     ]);
 
     let title = '';
     ytDlpProcess.stdout.on('data', (data) => {
+      console.log(`yt-dlp output for title: ${data.toString()}`);
       title += data.toString();
     });
 
@@ -221,12 +233,13 @@ const fetchSongUrl = (url) => {
     const ytDlpProcess = spawn('yt-dlp', [
       '-f', 'bestaudio',
       '-g',
-      '--cookies', config.cookiesFilePath,  // Use cookies path from config
+      '--cookies', config.cookiesFilePath,  // Ensure correct cookies file path
       url
     ]);
 
     let audioUrl = '';
     ytDlpProcess.stdout.on('data', (data) => {
+      console.log(`yt-dlp output for audio URL: ${data.toString()}`);
       audioUrl += data.toString();
     });
 
@@ -247,14 +260,15 @@ const fetchSongUrl = (url) => {
 // Inactivity timer logic
 const startInactivityTimeout = (guildId) => {
   if (inactivityTimeouts.has(guildId)) return;
+  console.log(`Starting inactivity timeout for guild ${guildId}`);
   inactivityTimeouts.set(
     guildId,
     setTimeout(() => {
       const serverQueue = queue.get(guildId);
       if (serverQueue) {
+        console.log(`Bot leaving voice channel due to inactivity in guild ${guildId}`);
         serverQueue.connection.destroy();
         queue.delete(guildId);
-        console.log(`Bot left due to inactivity in guild ${guildId}`);
       }
     }, INACTIVITY_TIMEOUT)
   );
@@ -285,9 +299,17 @@ const handleCriticalError = (error) => {
 };
 
 // Catch unhandled promise rejections
-process.on('unhandledRejection', handleCriticalError);
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled promise rejection at:', promise, 'reason:', reason);
+  handleCriticalError(reason);
+});
+
 // Catch uncaught exceptions
-process.on('uncaughtException', handleCriticalError);
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  handleCriticalError(error);
+});
+
 // Catch Discord client errors
 client.on('error', handleCriticalError);
 
