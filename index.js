@@ -92,11 +92,14 @@ function safeKill(proc, signal = 'SIGKILL') {
 
 /**
  * Creates a raw PCM (s16le 48kHz stereo) audio stream using yt-dlp -> ffmpeg.
+ * Suppresses expected stderr spam during intentional teardown (skip/stop/leave).
  *
  * @param {string} url
  * @returns {{ stream: import('stream').Readable, cleanup: () => void }}
  */
 function createStream(url) {
+  let shuttingDown = false;
+
   const ytdlp = spawn(
     'yt-dlp',
     [
@@ -139,6 +142,11 @@ function createStream(url) {
 
   ytdlp.stderr.on('data', (data) => {
     const msg = data.toString();
+
+    if (shuttingDown && (msg.includes('Broken pipe') || msg.includes('unable to write data'))) {
+      return;
+    }
+
     if (
       msg.includes('ERROR') ||
       msg.includes('nsig') ||
@@ -151,6 +159,18 @@ function createStream(url) {
 
   ffmpeg.stderr.on('data', (data) => {
     const msg = data.toString();
+
+    if (
+      shuttingDown &&
+      (msg.includes('Error submitting a packet to the muxer') ||
+        msg.includes('Error muxing a packet') ||
+        msg.includes('Invalid argument') ||
+        msg.includes('Task finished with error code: -22') ||
+        msg.includes('Terminating thread with return code -22'))
+    ) {
+      return;
+    }
+
     if (
       msg.includes('Error') ||
       msg.includes('Invalid') ||
@@ -185,6 +205,8 @@ function createStream(url) {
    * @returns {void}
    */
   const cleanup = () => {
+    shuttingDown = true;
+
     try {
       ytdlp.stdout?.unpipe(ffmpeg.stdin);
     } catch (_) {}
@@ -450,6 +472,7 @@ client.on('messageCreate', async (message) => {
     const serverQueue = queue.get(message.guild.id);
     if (!serverQueue) return logAndReply(message, 'There is no song currently playing to skip!');
 
+    // Start teardown first to reduce expected stderr spam
     try {
       serverQueue.current?.cleanup?.();
     } catch (_) {}
