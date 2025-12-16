@@ -8,7 +8,7 @@ const {
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
 const fs = require('fs');
-const config = require('./config');  // Import config.js
+const config = require('./config'); // Import config.js
 
 // Read the token from token.txt using the path from config
 const token = fs.readFileSync(config.tokenFilePath, 'utf8').trim();
@@ -33,28 +33,44 @@ let inactivityTimeouts = new Map();
 
 // ───────────────────────────────────────────────
 // Helper: Create audio stream with yt-dlp + ffmpeg
+// Returns: { stream, kill }
 // ───────────────────────────────────────────────
 function createStream(url) {
   console.log(`Starting yt-dlp stream for URL: ${url}`);
 
-  const ytdlp = spawn('yt-dlp', [
-    '-f', 'bestaudio[ext=m4a]/bestaudio/best',
-    '-o', '-',
-    '--quiet',
-    '--no-warnings',
-    '--cookies', config.cookiesFilePath,
-    '--extractor-args', 'youtube:player_client=android',
-    url
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ytdlp = spawn(
+    'yt-dlp',
+    [
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+      '-o', '-',
+      '--quiet',
+      '--no-warnings',
+      '--cookies', config.cookiesFilePath,
+      '--extractor-args', 'youtube:player_client=android',
+      url
+    ],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    }
+  );
 
-  const ffmpeg = spawn('ffmpeg', [
-    '-i', 'pipe:0',
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-    'pipe:1'
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const ffmpeg = spawn(
+    'ffmpeg',
+    [
+      '-i', 'pipe:0',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1'
+    ],
+    {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true
+    }
+  );
 
+  // Pipe audio into ffmpeg
   ytdlp.stdout.pipe(ffmpeg.stdin);
 
   // ── Clean Logging ──
@@ -86,7 +102,27 @@ function createStream(url) {
   ytdlp.on('error', (err) => console.error('yt-dlp process error:', err));
   ffmpeg.on('error', (err) => console.error('ffmpeg process error:', err));
 
-  return ffmpeg.stdout;
+  // IMPORTANT: Kill both processes when we’re done
+  const kill = () => {
+    try {
+      if (ffmpeg && !ffmpeg.killed) ffmpeg.kill('SIGKILL');
+    } catch (_) {}
+    try {
+      if (ytdlp && !ytdlp.killed) ytdlp.kill('SIGKILL');
+    } catch (_) {}
+  };
+
+  // If the output stream closes/ends, clean up processes
+  ffmpeg.stdout.on('end', kill);
+  ffmpeg.stdout.on('close', kill);
+
+  // If either process exits, make sure the other is stopped too
+  ytdlp.on('close', () => {
+    try { ffmpeg.stdin.end(); } catch (_) {}
+  });
+  ffmpeg.on('close', kill);
+
+  return { stream: ffmpeg.stdout, kill };
 }
 
 // ───────────────────────────────────────────────
@@ -121,6 +157,8 @@ client.on('messageCreate', async (message) => {
         playing: false,
         player: createAudioPlayer(),
         textChannel: message.channel,
+        // track cleanup handle for current yt-dlp/ffmpeg
+        currentKill: null,
       };
       queue.set(guildId, serverQueue);
     }
@@ -152,6 +190,13 @@ client.on('messageCreate', async (message) => {
     if (!serverQueue) {
       return message.reply('There is no song currently playing to skip!');
     }
+
+    // Kill current ffmpeg/yt-dlp so their windows/processes don’t hang around
+    if (typeof serverQueue.currentKill === 'function') {
+      serverQueue.currentKill();
+      serverQueue.currentKill = null;
+    }
+
     serverQueue.player.stop();
     message.reply('Skipping to the next song.');
     console.log('Skipping current song...');
@@ -162,6 +207,13 @@ client.on('messageCreate', async (message) => {
     const serverQueue = queue.get(message.guild.id);
     if (serverQueue) {
       clearInactivityTimeout(message.guild.id);
+
+      // Kill current ffmpeg/yt-dlp immediately
+      if (typeof serverQueue.currentKill === 'function') {
+        serverQueue.currentKill();
+        serverQueue.currentKill = null;
+      }
+
       serverQueue.connection.destroy();
       queue.delete(message.guild.id);
       message.reply('I have left the voice channel and cleared the queue!');
@@ -224,7 +276,15 @@ const playNextInQueue = async (guildId) => {
   console.log(`Playing next song: ${song.title}`);
 
   try {
-    const stream = createStream(song.url);
+    // If anything is still running from a prior track, kill it
+    if (typeof serverQueue.currentKill === 'function') {
+      serverQueue.currentKill();
+      serverQueue.currentKill = null;
+    }
+
+    const { stream, kill } = createStream(song.url);
+    serverQueue.currentKill = kill;
+
     const resource = createAudioResource(stream, { inputType: StreamType.Raw });
 
     serverQueue.player.play(resource);
@@ -238,19 +298,41 @@ const playNextInQueue = async (guildId) => {
 
     serverQueue.player.once(AudioPlayerStatus.Idle, () => {
       console.log('Audio player is idle. Song finished.');
+
+      // Kill yt-dlp/ffmpeg so the windows don’t remain
+      if (typeof serverQueue.currentKill === 'function') {
+        serverQueue.currentKill();
+        serverQueue.currentKill = null;
+      }
+
       serverQueue.playing = false;
       playNextInQueue(guildId);
     });
 
-    serverQueue.player.on('error', (error) => {
+    // Use once so we don’t stack listeners across tracks
+    serverQueue.player.once('error', (error) => {
       console.error('Playback error:', error);
+
+      if (typeof serverQueue.currentKill === 'function') {
+        serverQueue.currentKill();
+        serverQueue.currentKill = null;
+      }
+
       serverQueue.playing = false;
       playNextInQueue(guildId);
     });
   } catch (error) {
     console.error('Error playing audio stream:', error);
-    serverQueue.playing = false;
-    playNextInQueue(guildId);
+
+    if (typeof serverQueue?.currentKill === 'function') {
+      serverQueue.currentKill();
+      serverQueue.currentKill = null;
+    }
+
+    if (serverQueue) {
+      serverQueue.playing = false;
+      playNextInQueue(guildId);
+    }
   }
 };
 
@@ -259,11 +341,15 @@ const playNextInQueue = async (guildId) => {
 // ───────────────────────────────────────────────
 const fetchSongTitle = (url) => {
   return new Promise((resolve, reject) => {
-    const ytDlpProcess = spawn('yt-dlp', [
-      '--get-title',
-      '--cookies', config.cookiesFilePath,
-      url
-    ]);
+    const ytDlpProcess = spawn(
+      'yt-dlp',
+      [
+        '--get-title',
+        '--cookies', config.cookiesFilePath,
+        url
+      ],
+      { windowsHide: true }
+    );
 
     let title = '';
     ytDlpProcess.stdout.on('data', (data) => {
@@ -299,6 +385,12 @@ const startInactivityTimeout = (guildId) => {
       const serverQueue = queue.get(guildId);
       if (serverQueue) {
         console.log(`Bot leaving voice channel due to inactivity in guild ${guildId}`);
+
+        if (typeof serverQueue.currentKill === 'function') {
+          serverQueue.currentKill();
+          serverQueue.currentKill = null;
+        }
+
         serverQueue.connection.destroy();
         queue.delete(guildId);
       }
@@ -322,10 +414,13 @@ const handleCriticalError = (error) => {
   queue.forEach(({ textChannel }) => {
     textChannel.send('Encountered an error. Attempting to fix...');
   });
-  const updateProcess = spawn('yt-dlp', ['-U'], { stdio: 'inherit' });
+
+  // Hide window even when inheriting stdio
+  const updateProcess = spawn('yt-dlp', ['-U'], { stdio: 'inherit', windowsHide: true });
+
   updateProcess.on('close', (code) => {
     console.log(`yt-dlp updated, restarting bot (exit code ${code})...`);
-    spawn('pm2', ['restart', 'all', '--update-env'], { stdio: 'inherit' });
+    spawn('pm2', ['restart', 'all', '--update-env'], { stdio: 'inherit', windowsHide: true });
     process.exit(1);
   });
 };
