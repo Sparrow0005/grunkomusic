@@ -7,6 +7,9 @@ node_modules/
 npm-debug.log
 bot.log
 bot-error.log
+bot.log.1
+bot-error.log.1
+watchdog-output.log
 
 # OS-specific files
 .DS_Store

@@ -17,6 +17,60 @@ const config = require('./config');
 
 const prefix = '-';
 const guildQueues = new Map();
+let ytdlpUpdatePromise = null;
+let lastYtdlpUpdateAttempt = 0;
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function errorText(error) {
+  return [error?.message, error?.stderr, error?.cause?.message].filter(Boolean).join('\n');
+}
+
+function isPermanentMediaError(error) {
+  return /private video|video unavailable|removed by the uploader|copyright|members-only|sign in to confirm your age|unsupported url|invalid url/i.test(errorText(error));
+}
+
+function suggestsYtdlpUpdate(error) {
+  return /signature|nsig|extractor|player response|requested format is not available|unable to extract/i.test(errorText(error));
+}
+
+async function updateYtdlp(reason = 'scheduled maintenance', force = false) {
+  const now = Date.now();
+  if (!force && now - lastYtdlpUpdateAttempt < config.ytdlpUpdateCooldown) return false;
+  if (ytdlpUpdatePromise) return ytdlpUpdatePromise;
+  lastYtdlpUpdateAttempt = now;
+  console.log(`[RECOVERY] Checking yt-dlp for updates: ${reason}`);
+  ytdlpUpdatePromise = ytdlp.exec('--update')
+    .then(() => {
+      console.log('[RECOVERY] yt-dlp update check completed.');
+      return true;
+    })
+    .catch((error) => {
+      console.error('[RECOVERY] yt-dlp update failed; continuing with the installed version:', errorText(error));
+      return false;
+    })
+    .finally(() => { ytdlpUpdatePromise = null; });
+  return ytdlpUpdatePromise;
+}
+
+async function withRecovery(operation, { label, retries, allowYtdlpUpdate = false }) {
+  let updated = false;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const permanent = isPermanentMediaError(error);
+      console.error(`[RECOVERY] ${label} failed (attempt ${attempt + 1}/${retries + 1}, permanent=${permanent}):`, errorText(error));
+      if (permanent || attempt >= retries) throw error;
+      if (allowYtdlpUpdate && !updated && suggestsYtdlpUpdate(error)) {
+        updated = await updateYtdlp(`${label} extractor failure`);
+      }
+      const delay = config.retryBaseDelay * (2 ** attempt);
+      console.log(`[RECOVERY] Retrying ${label} in ${delay}ms.`);
+      await sleep(delay);
+    }
+  }
+}
 
 function readToken() {
   if (process.env.DISCORD_TOKEN?.trim()) return process.env.DISCORD_TOKEN.trim();
@@ -43,22 +97,29 @@ function ytdlpOptions() {
 async function resolveSong(url) {
   const parsed = new URL(url);
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
-  const info = await ytdlp(url, {
+  const info = await withRecovery(() => ytdlp(url, {
     dumpSingleJson: true,
     noPlaylist: true,
     noWarnings: true,
+    socketTimeout: 15,
     ...ytdlpOptions(),
-  });
+  }), { label: 'YouTube metadata lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
   return { url, title: info.title || 'Unknown title' };
 }
 
 function createAudioPipeline(url) {
+  let intentionalShutdown = false;
+  let downloadErrors = '';
+  let ffmpegErrors = '';
   const download = ytdlp.exec(url, {
     format: 'bestaudio/best',
     output: '-',
     noPlaylist: true,
     noWarnings: true,
     quiet: true,
+    retries: 3,
+    fragmentRetries: 3,
+    socketTimeout: 15,
     ...ytdlpOptions(),
   }, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -68,15 +129,32 @@ function createAudioPipeline(url) {
   ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
 
   download.stdout.pipe(ffmpeg.stdin);
-  download.stderr.on('data', (data) => console.error(`yt-dlp: ${data.toString().trim()}`));
-  ffmpeg.stderr.on('data', (data) => console.error(`ffmpeg: ${data.toString().trim()}`));
-  download.on('error', (error) => ffmpeg.stdout.destroy(error));
-  ffmpeg.on('error', (error) => ffmpeg.stdout.destroy(error));
+  download.stderr.on('data', (data) => {
+    downloadErrors = `${downloadErrors}${data}`.slice(-8000);
+    console.error(`yt-dlp: ${data.toString().trim()}`);
+  });
+  ffmpeg.stderr.on('data', (data) => {
+    ffmpegErrors = `${ffmpegErrors}${data}`.slice(-8000);
+    console.error(`ffmpeg: ${data.toString().trim()}`);
+  });
+  download.on('error', (error) => { if (!intentionalShutdown) ffmpeg.stdout.destroy(error); });
+  ffmpeg.on('error', (error) => { if (!intentionalShutdown) ffmpeg.stdout.destroy(error); });
+  download.on('close', (code) => {
+    if (!intentionalShutdown && code !== 0) {
+      ffmpeg.stdout.destroy(new Error(`yt-dlp exited with code ${code}: ${downloadErrors}`));
+    }
+  });
+  ffmpeg.on('close', (code) => {
+    if (!intentionalShutdown && code !== 0) {
+      ffmpeg.stdout.destroy(new Error(`FFmpeg exited with code ${code}: ${ffmpegErrors}`));
+    }
+  });
 
   let closed = false;
   const cleanup = () => {
     if (closed) return;
     closed = true;
+    intentionalShutdown = true;
     download.stdout?.unpipe(ffmpeg.stdin);
     download.kill();
     ffmpeg.kill();
@@ -144,17 +222,25 @@ async function getOrCreateQueue(message) {
   if (state) return state;
 
   const voiceChannel = message.member.voice.channel;
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId,
-    adapterCreator: message.guild.voiceAdapterCreator,
-    selfDeaf: true,
-  });
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-  } catch (error) {
-    connection.destroy();
-    throw new Error('Discord voice connection did not become ready.', { cause: error });
+  let connection;
+  for (let attempt = 0; attempt <= config.voiceConnectionRetries; attempt++) {
+    connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId,
+      adapterCreator: message.guild.voiceAdapterCreator,
+      selfDeaf: true,
+    });
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      break;
+    } catch (error) {
+      connection.destroy();
+      console.error(`[RECOVERY] Voice connection failed (attempt ${attempt + 1}/${config.voiceConnectionRetries + 1}):`, errorText(error));
+      if (attempt >= config.voiceConnectionRetries) {
+        throw new Error('Discord voice connection did not become ready.', { cause: error });
+      }
+      await sleep(config.retryBaseDelay * (attempt + 1));
+    }
   }
 
   const player = createAudioPlayer({
@@ -167,7 +253,17 @@ async function getOrCreateQueue(message) {
   player.on(AudioPlayerStatus.Idle, () => finishCurrent(guildId));
   player.on('error', (error) => {
     console.error('Playback error:', error);
-    logAndSend(state.textChannel, 'There was an error trying to play the video.');
+    const song = state.nowPlaying;
+    if (!song) return finishCurrent(guildId);
+    song.playbackAttempts = (song.playbackAttempts || 0) + 1;
+    if (!isPermanentMediaError(error) && song.playbackAttempts <= config.playbackRetries) {
+      console.log(`[RECOVERY] Re-queueing ${song.title} after playback failure (${song.playbackAttempts}/${config.playbackRetries}).`);
+      state.songs.unshift(song);
+      logAndSend(state.textChannel, `Playback hiccup—retrying **${song.title}**.`);
+      if (suggestsYtdlpUpdate(error)) updateYtdlp('playback extractor failure');
+    } else {
+      logAndSend(state.textChannel, `I couldn't recover **${song.title}**, so I'm skipping it.`);
+    }
     finishCurrent(guildId);
   });
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -220,7 +316,7 @@ client.on('messageCreate', async (message) => {
     }
 
     state.textChannel = message.channel;
-    state.songs.push(song);
+    state.songs.push({ ...song, playbackAttempts: 0 });
     await logAndReply(message, `Added to the queue: ${song.title}`);
     playNext(message.guild.id);
   }
@@ -274,10 +370,29 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.once('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
+client.once('clientReady', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  updateYtdlp('startup maintenance', true);
+  setInterval(() => updateYtdlp('scheduled daily maintenance'), config.ytdlpUpdateInterval).unref();
+});
 client.on('error', (error) => console.error('Discord client error:', error));
-process.on('SIGINT', () => { guildQueues.forEach((_, id) => destroyQueue(id)); client.destroy(); process.exit(0); });
-process.on('SIGTERM', () => { guildQueues.forEach((_, id) => destroyQueue(id)); client.destroy(); process.exit(0); });
+
+function shutdown(code = 0) {
+  guildQueues.forEach((_, id) => destroyQueue(id));
+  client.destroy();
+  process.exit(code);
+}
+
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
+process.on('uncaughtException', (error) => {
+  console.error('[FATAL] Uncaught exception; watchdog will restart the bot:', error);
+  shutdown(1);
+});
+process.on('unhandledRejection', (error) => {
+  console.error('[FATAL] Unhandled rejection; watchdog will restart the bot:', error);
+  shutdown(1);
+});
 
 client.login(readToken()).catch((error) => {
   console.error('Discord login failed:', error.message);

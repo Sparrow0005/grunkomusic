@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "watchdog": "powershell -NoProfile -ExecutionPolicy Bypass -File watchdog.ps1"
   },
   "engines": {
     "node": ">=20"
