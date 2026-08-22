@@ -1,7 +1,14 @@
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const { PassThrough } = require('node:stream');
-const { Client, GatewayIntentBits } = require('discord.js');
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+} = require('discord.js');
 const {
   AudioPlayerStatus,
   NoSubscriberBehavior,
@@ -189,15 +196,132 @@ async function sendQueue(message, songs) {
   for (const continuation of pages.slice(1)) await logAndSend(message.channel, continuation);
 }
 
+function buildQueueEmbed(guildId, requestedPage = 0) {
+  const songs = guildQueues.get(guildId)?.songs || [];
+  const pageCount = Math.max(1, Math.ceil(songs.length / 10));
+  const page = Math.min(Math.max(0, requestedPage), pageCount - 1);
+  const firstIndex = page * 10;
+  const pageSongs = songs.slice(firstIndex, firstIndex + 10);
+  const description = pageSongs.length
+    ? pageSongs.map((song, index) => `**${firstIndex + index + 1}.** ${song.title}`).join('\n')
+    : 'The queue is currently empty.';
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Current Queue')
+    .setDescription(description)
+    .setFooter({ text: `Page ${page + 1} of ${pageCount} • ${songs.length} upcoming song${songs.length === 1 ? '' : 's'}` });
+
+  if (pageCount === 1) return { embeds: [embed], components: [] };
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`queue:${guildId}:${page - 1}`)
+      .setLabel('Previous')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page === 0),
+    new ButtonBuilder()
+      .setCustomId(`queue:${guildId}:${page + 1}`)
+      .setLabel('Next')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(page === pageCount - 1),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
 function ytdlpOptions(useCookies = true) {
   return useCookies && cookiesAreUsable() ? { cookies: config.cookiesFilePath } : {};
 }
 
-async function resolveSong(url) {
-  const parsed = new URL(url);
+function normalizeMediaUrl(input) {
+  const parsed = new URL(input);
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
+
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  const youtubeHosts = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtube-nocookie.com', 'youtu.be']);
+  if (!youtubeHosts.has(hostname)) return parsed.toString();
+
+  let videoId = null;
+  if (hostname === 'youtu.be') {
+    videoId = parsed.pathname.split('/').filter(Boolean)[0];
+  } else if (parsed.pathname === '/watch') {
+    videoId = parsed.searchParams.get('v');
+  } else {
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (['shorts', 'live', 'embed'].includes(parts[0])) videoId = parts[1];
+  }
+
+  if (!videoId || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+    throw new Error('Invalid YouTube video URL');
+  }
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+function normalizePlaylistUrl(input) {
+  const parsed = new URL(input);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
+  const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  const youtubeHosts = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
+  if (!youtubeHosts.has(hostname)) throw new Error('Playlists must be YouTube URLs');
+  const playlistId = parsed.searchParams.get('list');
+  if (!playlistId || !/^[A-Za-z0-9_-]{10,}$/.test(playlistId)) {
+    throw new Error('Invalid YouTube playlist URL');
+  }
+  const seedVideoId = parsed.searchParams.get('v');
+  if (playlistId.startsWith('RD') && seedVideoId && /^[A-Za-z0-9_-]{11}$/.test(seedVideoId)) {
+    return `https://www.youtube.com/watch?v=${seedVideoId}&list=${playlistId}`;
+  }
+  return `https://www.youtube.com/playlist?list=${playlistId}`;
+}
+
+function containsYouTubePlaylist(input) {
+  try {
+    const parsed = new URL(input);
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    return ['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(hostname) &&
+      Boolean(parsed.searchParams.get('list'));
+  } catch {
+    return false;
+  }
+}
+
+async function resolvePlaylist(url, maxEntries) {
+  const normalizedUrl = normalizePlaylistUrl(url);
   const usedCookies = cookiesAreUsable();
-  const lookup = (useCookies) => withRecovery(() => ytdlp(url, {
+  const lookup = (useCookies) => withRecovery(() => ytdlp(normalizedUrl, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      playlistEnd: maxEntries,
+      noWarnings: true,
+      socketTimeout: 15,
+      ...ytdlpOptions(useCookies),
+    }), { label: 'YouTube playlist lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
+
+  let info;
+  try {
+    info = await lookup(usedCookies);
+  } catch (error) {
+    if (!usedCookies || !isCookieError(error)) throw error;
+    markCookiesUnhealthy(error);
+    console.log('[RECOVERY] Retrying playlist lookup without cookies.');
+    info = await lookup(false);
+  }
+
+  const songs = (info.entries || [])
+    .filter((entry) => entry?.id && /^[A-Za-z0-9_-]{11}$/.test(entry.id))
+    .filter((entry) => !/\[(private|deleted) video\]/i.test(entry.title || ''))
+    .slice(0, maxEntries)
+    .map((entry) => ({
+      url: `https://www.youtube.com/watch?v=${entry.id}`,
+      title: entry.title || 'Unknown title',
+      playbackAttempts: 0,
+    }));
+
+  return { title: info.title || 'YouTube playlist', songs };
+}
+
+async function resolveSong(url) {
+  const normalizedUrl = normalizeMediaUrl(url);
+  const usedCookies = cookiesAreUsable();
+  const lookup = (useCookies) => withRecovery(() => ytdlp(normalizedUrl, {
       dumpSingleJson: true,
       noPlaylist: true,
       noWarnings: true,
@@ -213,7 +337,7 @@ async function resolveSong(url) {
     console.log('[RECOVERY] Retrying metadata lookup without cookies.');
     info = await lookup(false);
   }
-  return { url, title: info.title || 'Unknown title' };
+  return { url: normalizedUrl, title: info.title || 'Unknown title' };
 }
 
 function createAudioPipeline(url) {
@@ -233,6 +357,13 @@ function createAudioPipeline(url) {
     socketTimeout: 15,
     ...ytdlpOptions(usedCookies),
   }, { stdio: ['ignore', 'pipe', 'pipe'] });
+  download.catch((error) => {
+    if (intentionalShutdown) {
+      console.log('[RECOVERY] Expected yt-dlp termination during playback cleanup.');
+      return;
+    }
+    output.destroy(new Error(`yt-dlp process failed: ${errorText(error).slice(0, 2000)}`));
+  });
 
   const ffmpeg = spawn(ffmpegPath, [
     '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
@@ -447,6 +578,9 @@ client.on('messageCreate', async (message) => {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
     const url = args[0];
     if (!url) return logAndReply(message, 'You need to provide a YouTube URL to play a song!');
+    if (containsYouTubePlaylist(url)) {
+      return logAndReply(message, 'That link contains a playlist. Use `-pl <URL>` or `-playlist <URL>` to queue it.');
+    }
     await warnAboutExpiredCookies(message);
     let song;
     try {
@@ -477,11 +611,54 @@ client.on('messageCreate', async (message) => {
     playNext(message.guild.id);
   }
 
+  if (command === 'playlist' || command === 'pl') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue a playlist!');
+    const url = args[0];
+    if (!url) return logAndReply(message, 'You need to provide a YouTube playlist URL!');
+    await warnAboutExpiredCookies(message);
+
+    let playlist;
+    try {
+      playlist = await resolvePlaylist(url, config.maxQueueSize);
+      await warnAboutExpiredCookies(message);
+    } catch (error) {
+      console.error('Error processing playlist:', error);
+      if (isCookieError(error) && cookieStatus() !== 'active') {
+        return logAndReply(message, `This playlist needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+      }
+      return logAndReply(message, 'There was an error trying to queue the playlist.');
+    }
+
+    let state;
+    try {
+      state = await getOrCreateQueue(message);
+    } catch (error) {
+      console.error('Error connecting to voice for playlist:', error);
+      return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
+    }
+
+    const availableSlots = Math.max(0, config.maxQueueSize - state.songs.length);
+    const songsToAdd = playlist.songs.slice(0, availableSlots);
+    if (!songsToAdd.length) {
+      const reason = availableSlots === 0 ? `The queue is full (${config.maxQueueSize} songs).` : 'I could not find any playable videos in that playlist.';
+      return logAndReply(message, reason);
+    }
+
+    state.textChannel = message.channel;
+    state.songs.push(...songsToAdd);
+    const omitted = playlist.songs.length - songsToAdd.length;
+    const suffix = omitted > 0 ? ` The queue limit left out ${omitted} song${omitted === 1 ? '' : 's'}.` : '';
+    await logAndReply(message, `Added **${songsToAdd.length}** songs from **${playlist.title}**.${suffix}`);
+    playNext(message.guild.id);
+  }
+
   if (command === 'skip' || command === 's') {
     const state = guildQueues.get(message.guild.id);
     if (!state?.nowPlaying) return logAndReply(message, 'There is no song currently playing to skip!');
+    const generation = state.current?.generation;
     state.current?.cleanup();
     state.player.stop(true);
+    finishCurrent(message.guild.id, generation);
     return logAndReply(message, 'Skipping to the next song.');
   }
 
@@ -504,6 +681,11 @@ client.on('messageCreate', async (message) => {
   if (command === 'queue' || command === 'q') {
     const state = guildQueues.get(message.guild.id);
     if (!state?.songs.length) return logAndReply(message, 'The queue is currently empty.');
+    if (state.songs.length > 10) {
+      console.log(`[BOT → ${message.guild.name}#${message.channel.name}] Displaying paginated queue.`);
+      return message.reply(buildQueueEmbed(message.guild.id, 0))
+        .catch((error) => console.error('Could not send paginated queue:', error));
+    }
     return sendQueue(message, state.songs);
   }
 
@@ -527,6 +709,7 @@ client.on('messageCreate', async (message) => {
     return logAndReply(message,
       '**Commands List:**\n' +
       '`-play <URL>` or `-p <URL>` - Plays the requested song\n' +
+      '`-playlist <URL>` or `-pl <URL>` - Adds a YouTube playlist\n' +
       '`-skip` or `-s` - Skips the current song\n' +
       '`-leave` or `-l` - Disconnects bot from the voice channel\n' +
       '`-shuffle` - Shuffles the current queue\n' +
@@ -534,6 +717,23 @@ client.on('messageCreate', async (message) => {
       '`-playing` or `-np` - Displays the current song title\n' +
       '`-health` - Displays playback and YouTube cookie health\n' +
       '`-help` or `-h` - Displays this help message');
+  }
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton() || !interaction.customId.startsWith('queue:')) return;
+  const match = /^queue:(\d+):(-?\d+)$/.exec(interaction.customId);
+  if (!match || interaction.guildId !== match[1]) {
+    return interaction.reply({ content: 'That queue control is no longer valid.', ephemeral: true });
+  }
+  const page = Number.parseInt(match[2], 10);
+  try {
+    await interaction.update(buildQueueEmbed(interaction.guildId, page));
+  } catch (error) {
+    console.error('Could not update paginated queue:', error);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'I could not update that queue page.', ephemeral: true }).catch(() => {});
+    }
   }
 });
 
