@@ -1,16 +1,189 @@
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
 const { Client, GatewayIntentBits } = require('discord.js');
 const {
-  joinVoiceChannel,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  StreamType,
+  VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
-  AudioPlayerStatus,
-  StreamType,
+  entersState,
+  joinVoiceChannel,
 } = require('@discordjs/voice');
-const { spawn } = require('child_process');
-const fs = require('fs');
+const ffmpegPath = require('ffmpeg-static');
+const ytdlp = require('youtube-dl-exec');
 const config = require('./config');
 
-const token = fs.readFileSync(config.tokenFilePath, 'utf8').trim();
+const prefix = '-';
+const guildQueues = new Map();
+
+function readToken() {
+  if (process.env.DISCORD_TOKEN?.trim()) return process.env.DISCORD_TOKEN.trim();
+  if (!fs.existsSync(config.tokenFilePath)) {
+    throw new Error(`Discord token not found. Put it in ${config.tokenFilePath} or set DISCORD_TOKEN.`);
+  }
+  return fs.readFileSync(config.tokenFilePath, 'utf8').trim();
+}
+
+function logAndSend(channel, content) {
+  console.log(`[BOT → ${channel?.guild?.name ?? 'Unknown'}#${channel?.name ?? 'Unknown'}] ${content}`);
+  return channel.send(content).catch((error) => console.error('Could not send Discord message:', error));
+}
+
+function logAndReply(message, content) {
+  console.log(`[BOT → ${message.guild?.name ?? 'Unknown'}#${message.channel?.name ?? 'Unknown'}] ${content}`);
+  return message.reply(content).catch((error) => console.error('Could not reply in Discord:', error));
+}
+
+function ytdlpOptions() {
+  return fs.existsSync(config.cookiesFilePath) ? { cookies: config.cookiesFilePath } : {};
+}
+
+async function resolveSong(url) {
+  const parsed = new URL(url);
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
+  const info = await ytdlp(url, {
+    dumpSingleJson: true,
+    noPlaylist: true,
+    noWarnings: true,
+    ...ytdlpOptions(),
+  });
+  return { url, title: info.title || 'Unknown title' };
+}
+
+function createAudioPipeline(url) {
+  const download = ytdlp.exec(url, {
+    format: 'bestaudio/best',
+    output: '-',
+    noPlaylist: true,
+    noWarnings: true,
+    quiet: true,
+    ...ytdlpOptions(),
+  }, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const ffmpeg = spawn(ffmpegPath, [
+    '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+    '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+  ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+
+  download.stdout.pipe(ffmpeg.stdin);
+  download.stderr.on('data', (data) => console.error(`yt-dlp: ${data.toString().trim()}`));
+  ffmpeg.stderr.on('data', (data) => console.error(`ffmpeg: ${data.toString().trim()}`));
+  download.on('error', (error) => ffmpeg.stdout.destroy(error));
+  ffmpeg.on('error', (error) => ffmpeg.stdout.destroy(error));
+
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    download.stdout?.unpipe(ffmpeg.stdin);
+    download.kill();
+    ffmpeg.kill();
+  };
+
+  return { stream: ffmpeg.stdout, cleanup };
+}
+
+function clearIdleTimer(state) {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  state.idleTimer = null;
+}
+
+function destroyQueue(guildId) {
+  const state = guildQueues.get(guildId);
+  if (!state) return;
+  clearIdleTimer(state);
+  state.current?.cleanup();
+  state.player.stop(true);
+  state.connection.destroy();
+  guildQueues.delete(guildId);
+}
+
+function scheduleDisconnect(guildId) {
+  const state = guildQueues.get(guildId);
+  if (!state || state.idleTimer) return;
+  state.idleTimer = setTimeout(() => destroyQueue(guildId), config.inactivityTimeout);
+}
+
+async function playNext(guildId) {
+  const state = guildQueues.get(guildId);
+  if (!state || state.playing) return;
+  const song = state.songs.shift();
+  if (!song) return scheduleDisconnect(guildId);
+
+  clearIdleTimer(state);
+  state.playing = true;
+  state.nowPlaying = song;
+
+  try {
+    const pipeline = createAudioPipeline(song.url);
+    state.current = pipeline;
+    state.player.play(createAudioResource(pipeline.stream, { inputType: StreamType.Raw }));
+    await logAndSend(state.textChannel, `🎶 Now playing: **${song.title}**`);
+  } catch (error) {
+    console.error('Could not start playback:', error);
+    await logAndSend(state.textChannel, `There was an error trying to play **${song.title}**.`);
+    finishCurrent(guildId);
+  }
+}
+
+function finishCurrent(guildId) {
+  const state = guildQueues.get(guildId);
+  if (!state) return;
+  state.current?.cleanup();
+  state.current = null;
+  state.playing = false;
+  state.nowPlaying = null;
+  setImmediate(() => playNext(guildId));
+}
+
+async function getOrCreateQueue(message) {
+  const guildId = message.guild.id;
+  let state = guildQueues.get(guildId);
+  if (state) return state;
+
+  const voiceChannel = message.member.voice.channel;
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: message.guild.voiceAdapterCreator,
+    selfDeaf: true,
+  });
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch (error) {
+    connection.destroy();
+    throw new Error('Discord voice connection did not become ready.', { cause: error });
+  }
+
+  const player = createAudioPlayer({
+    behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+  });
+  state = {
+    connection, player, songs: [], playing: false, nowPlaying: null,
+    current: null, textChannel: message.channel, idleTimer: null,
+  };
+  player.on(AudioPlayerStatus.Idle, () => finishCurrent(guildId));
+  player.on('error', (error) => {
+    console.error('Playback error:', error);
+    logAndSend(state.textChannel, 'There was an error trying to play the video.');
+    finishCurrent(guildId);
+  });
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      destroyQueue(guildId);
+    }
+  });
+  connection.subscribe(player);
+  guildQueues.set(guildId, state);
+  return state;
+}
 
 const client = new Client({
   intents: [
@@ -21,533 +194,92 @@ const client = new Client({
   ],
 });
 
-const prefix = '-';
-const queue = new Map();
-let currentPlaying = null;
-
-const PLAYBACK_COOLDOWN = 2000;
-const INACTIVITY_TIMEOUT = config.inactivityTimeout;
-const inactivityTimeouts = new Map();
-
-/**
- * Logs and sends a message to a channel.
- *
- * @param {import('discord.js').TextBasedChannel} channel
- * @param {string} content
- * @returns {Promise<import('discord.js').Message>}
- */
-function logAndSend(channel, content) {
-  const guildName = channel?.guild?.name ?? 'DM/UnknownGuild';
-  const channelName = channel?.name ?? 'UnknownChannel';
-  console.log(`[BOT → ${guildName}#${channelName}] ${content}`);
-  return channel.send(content);
-}
-
-/**
- * Logs and replies to a message.
- *
- * @param {import('discord.js').Message} message
- * @param {string} content
- * @returns {Promise<import('discord.js').Message>}
- */
-function logAndReply(message, content) {
-  const guildName = message?.guild?.name ?? 'DM/UnknownGuild';
-  const channelName = message?.channel?.name ?? 'UnknownChannel';
-  console.log(`[BOT → ${guildName}#${channelName}] ${content}`);
-  return message.reply(content);
-}
-
-/**
- * Checks whether an error is expected when a stream is intentionally stopped
- * (e.g., skip/leave/stop).
- *
- * @param {any} err
- * @returns {boolean}
- */
-function isNonCriticalPipeError(err) {
-  if (!err) return false;
-  const code = err.code || '';
-  const msg = String(err.message || '');
-  return (
-    code === 'EOF' ||
-    code === 'EPIPE' ||
-    code === 'ERR_STREAM_PREMATURE_CLOSE' ||
-    msg.includes('write EOF') ||
-    msg.includes('Premature close')
-  );
-}
-
-/**
- * Safely kills a child process without throwing.
- *
- * @param {import('child_process').ChildProcess | null | undefined} proc
- * @param {NodeJS.Signals} [signal='SIGKILL']
- * @returns {void}
- */
-function safeKill(proc, signal = 'SIGKILL') {
-  try {
-    if (proc && !proc.killed) proc.kill(signal);
-  } catch (_) {}
-}
-
-/**
- * Creates a raw PCM (s16le 48kHz stereo) audio stream using yt-dlp -> ffmpeg.
- * Suppresses expected stderr spam during intentional teardown (skip/stop/leave).
- *
- * @param {string} url
- * @returns {{ stream: import('stream').Readable, cleanup: () => void }}
- */
-function createStream(url) {
-  let shuttingDown = false;
-
-  const ytdlp = spawn(
-    'yt-dlp',
-    [
-      '-f',
-      'bestaudio[ext=m4a]/bestaudio/best',
-      '-o',
-      '-',
-      '--quiet',
-      '--no-warnings',
-      '--cookies',
-      config.cookiesFilePath,
-      '--extractor-args',
-      'youtube:player_client=android',
-      url,
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
-  );
-
-  const ffmpeg = spawn(
-    'ffmpeg',
-    ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
-    { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-  );
-
-  ytdlp.stdout.pipe(ffmpeg.stdin);
-
-  /**
-   * Builds an error handler that suppresses expected pipe errors.
-   *
-   * @param {string} label
-   * @returns {(err: any) => void}
-   */
-  const ignoreIfExpected = (label) => (err) => {
-    if (isNonCriticalPipeError(err)) {
-      console.log(`Non-critical ${label} (ignored): ${err.message || err}`);
-      return;
-    }
-    console.error(`${label}:`, err);
-  };
-
-  ytdlp.stderr.on('data', (data) => {
-    const msg = data.toString();
-
-    if (shuttingDown && (msg.includes('Broken pipe') || msg.includes('unable to write data'))) {
-      return;
-    }
-
-    if (
-      msg.includes('ERROR') ||
-      msg.includes('nsig') ||
-      msg.includes('Requested format') ||
-      msg.includes('failed')
-    ) {
-      console.error(`yt-dlp: ${msg.trim()}`);
-    }
-  });
-
-  ffmpeg.stderr.on('data', (data) => {
-    const msg = data.toString();
-
-    if (
-      shuttingDown &&
-      (msg.includes('Error submitting a packet to the muxer') ||
-        msg.includes('Error muxing a packet') ||
-        msg.includes('Invalid argument') ||
-        msg.includes('Task finished with error code: -22') ||
-        msg.includes('Terminating thread with return code -22'))
-    ) {
-      return;
-    }
-
-    if (
-      msg.includes('Error') ||
-      msg.includes('Invalid') ||
-      msg.includes('failed') ||
-      msg.includes('Could not')
-    ) {
-      console.error(`ffmpeg: ${msg.trim()}`);
-    }
-  });
-
-  ytdlp.on('error', ignoreIfExpected('yt-dlp process error'));
-  ffmpeg.on('error', ignoreIfExpected('ffmpeg process error'));
-
-  // Stream-level handlers prevent "write EOF" from becoming an uncaught exception on skip/stop.
-  ffmpeg.stdin.on('error', ignoreIfExpected('ffmpeg stdin pipe error'));
-  ffmpeg.stdout.on('error', ignoreIfExpected('ffmpeg stdout pipe error'));
-  ytdlp.stdout.on('error', ignoreIfExpected('yt-dlp stdout pipe error'));
-
-  ytdlp.on('close', () => {
-    try {
-      if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) ffmpeg.stdin.end();
-    } catch (_) {}
-  });
-
-  ffmpeg.on('close', () => {
-    safeKill(ytdlp, 'SIGKILL');
-  });
-
-  /**
-   * Stops piping and tears down the pipeline immediately.
-   *
-   * @returns {void}
-   */
-  const cleanup = () => {
-    shuttingDown = true;
-
-    try {
-      ytdlp.stdout?.unpipe(ffmpeg.stdin);
-    } catch (_) {}
-
-    try {
-      ffmpeg.stdin?.destroy();
-    } catch (_) {}
-
-    try {
-      ffmpeg.stdout?.destroy();
-    } catch (_) {}
-
-    try {
-      ytdlp.stdout?.destroy();
-    } catch (_) {}
-
-    safeKill(ffmpeg, 'SIGKILL');
-    safeKill(ytdlp, 'SIGKILL');
-  };
-
-  return { stream: ffmpeg.stdout, cleanup };
-}
-
-/**
- * Starts the inactivity timeout for a guild (no-op if already running).
- *
- * @param {string} guildId
- * @returns {void}
- */
-const startInactivityTimeout = (guildId) => {
-  if (inactivityTimeouts.has(guildId)) return;
-
-  inactivityTimeouts.set(
-    guildId,
-    setTimeout(() => {
-      const serverQueue = queue.get(guildId);
-      if (!serverQueue) return;
-
-      try {
-        serverQueue.current?.cleanup?.();
-      } catch (_) {}
-      serverQueue.connection.destroy();
-      queue.delete(guildId);
-    }, INACTIVITY_TIMEOUT)
-  );
-};
-
-/**
- * Clears the inactivity timeout for a guild.
- *
- * @param {string} guildId
- * @returns {void}
- */
-const clearInactivityTimeout = (guildId) => {
-  const timeout = inactivityTimeouts.get(guildId);
-  if (!timeout) return;
-  clearTimeout(timeout);
-  inactivityTimeouts.delete(guildId);
-};
-
-/**
- * Plays the next song in the guild queue.
- *
- * @param {string} guildId
- * @returns {Promise<void>}
- */
-const playNextInQueue = async (guildId) => {
-  const serverQueue = queue.get(guildId);
-  if (!serverQueue || serverQueue.songs.length === 0) {
-    startInactivityTimeout(guildId);
-    return;
-  }
-
-  try {
-    serverQueue.current?.cleanup?.();
-  } catch (_) {}
-  serverQueue.current = null;
-
-  clearInactivityTimeout(guildId);
-
-  const song = serverQueue.songs.shift();
-
-  try {
-    const { stream, cleanup } = createStream(song.url);
-    serverQueue.current = { cleanup };
-
-    const resource = createAudioResource(stream, { inputType: StreamType.Raw });
-    serverQueue.player.play(resource);
-    serverQueue.connection.subscribe(serverQueue.player);
-
-    serverQueue.playing = true;
-    currentPlaying = song.title;
-
-    setTimeout(() => {
-      logAndSend(serverQueue.textChannel, `🎶 Now playing: **${song.title}**`);
-    }, PLAYBACK_COOLDOWN);
-
-    serverQueue.player.once(AudioPlayerStatus.Idle, () => {
-      serverQueue.playing = false;
-
-      try {
-        serverQueue.current?.cleanup?.();
-      } catch (_) {}
-      serverQueue.current = null;
-
-      playNextInQueue(guildId);
-    });
-
-    serverQueue.player.once('error', (error) => {
-      if (isNonCriticalPipeError(error)) {
-        console.log(`Non-critical playback error (ignored): ${error.message || error}`);
-      } else {
-        console.error('Playback error:', error);
-      }
-
-      serverQueue.playing = false;
-
-      try {
-        serverQueue.current?.cleanup?.();
-      } catch (_) {}
-      serverQueue.current = null;
-
-      playNextInQueue(guildId);
-    });
-  } catch (error) {
-    console.error('Error playing audio stream:', error);
-
-    serverQueue.playing = false;
-
-    try {
-      serverQueue.current?.cleanup?.();
-    } catch (_) {}
-    serverQueue.current = null;
-
-    playNextInQueue(guildId);
-  }
-};
-
-/**
- * Fetches a video's title using yt-dlp.
- *
- * @param {string} url
- * @returns {Promise<string>}
- */
-const fetchSongTitle = (url) =>
-  new Promise((resolve, reject) => {
-    const ytDlpProcess = spawn(
-      'yt-dlp',
-      ['--get-title', '--cookies', config.cookiesFilePath, url],
-      { windowsHide: true }
-    );
-
-    let title = '';
-    ytDlpProcess.stdout.on('data', (data) => {
-      title += data.toString();
-    });
-
-    ytDlpProcess.stderr.on('data', (error) => {
-      const msg = error.toString();
-      if (msg.includes('ERROR') || msg.includes('failed')) {
-        console.error(`yt-dlp: ${msg.trim()}`);
-      }
-    });
-
-    ytDlpProcess.on('close', (code) => {
-      if (code === 0) return resolve(title.trim());
-      reject(new Error('Failed to fetch song title.'));
-    });
-  });
-
-/**
- * Handles errors and attempts a recovery (yt-dlp update + PM2 restart).
- * Expected pipe errors are ignored.
- *
- * @param {any} error
- * @returns {void}
- */
-const handleCriticalError = (error) => {
-  if (isNonCriticalPipeError(error)) {
-    console.log(`Non-critical pipe error (ignored): ${error.message || error}`);
-    return;
-  }
-
-  console.error('Critical error:', error);
-  queue.forEach(({ textChannel }) => {
-    logAndSend(textChannel, 'Encountered an error. Attempting to fix.');
-  });
-
-  const updateProcess = spawn('yt-dlp', ['-U'], { stdio: 'inherit', windowsHide: true });
-  updateProcess.on('close', (code) => {
-    console.log(`yt-dlp updated, restarting bot (exit code ${code})...`);
-    spawn('pm2', ['restart', 'all', '--update-env'], { stdio: 'inherit', windowsHide: true });
-    process.exit(1);
-  });
-};
-
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
-  handleCriticalError(reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
-  handleCriticalError(error);
-});
-
-client.on('error', handleCriticalError);
-
 client.on('messageCreate', async (message) => {
-  if (!message.content.startsWith(prefix) || message.author.bot) return;
-
-  const args = message.content.slice(prefix.length).trim().split(/ +/);
-  const command = args.shift().toLowerCase();
+  if (!message.guild || message.author.bot || !message.content.startsWith(prefix)) return;
+  const args = message.content.slice(prefix.length).trim().split(/\s+/);
+  const command = args.shift()?.toLowerCase();
 
   if (command === 'play' || command === 'p') {
-    if (!message.member.voice.channel) {
-      return logAndReply(message, 'You need to be in a voice channel to play music!');
-    }
-
-    const voiceChannel = message.member.voice.channel;
-    const guildId = message.guild.id;
-
-    let serverQueue = queue.get(guildId);
-    if (!serverQueue) {
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
-
-      serverQueue = {
-        connection,
-        songs: [],
-        playing: false,
-        player: createAudioPlayer(),
-        textChannel: message.channel,
-        current: null,
-      };
-
-      queue.set(guildId, serverQueue);
-    }
-
-    clearInactivityTimeout(guildId);
-
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
     const url = args[0];
     if (!url) return logAndReply(message, 'You need to provide a YouTube URL to play a song!');
-
+    let song;
     try {
-      const songTitle = await fetchSongTitle(url);
-      serverQueue.songs.push({ url, title: songTitle });
-
-      if (!serverQueue.playing) playNextInQueue(guildId);
-
-      logAndReply(message, `Added to the queue: ${songTitle}`);
+      song = await resolveSong(url);
     } catch (error) {
-      console.error('Error processing the video:', error);
-      logAndReply(message, 'There was an error trying to play the video.');
-      handleCriticalError(error);
+      console.error('Error processing video:', error);
+      return logAndReply(message, 'There was an error trying to play the video.');
     }
+
+    let state;
+    try {
+      state = await getOrCreateQueue(message);
+    } catch (error) {
+      console.error('Error connecting to voice:', error);
+      return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
+    }
+
+    state.textChannel = message.channel;
+    state.songs.push(song);
+    await logAndReply(message, `Added to the queue: ${song.title}`);
+    playNext(message.guild.id);
   }
 
   if (command === 'skip' || command === 's') {
-    const serverQueue = queue.get(message.guild.id);
-    if (!serverQueue) return logAndReply(message, 'There is no song currently playing to skip!');
-
-    // Start teardown first to reduce expected stderr spam
-    try {
-      serverQueue.current?.cleanup?.();
-    } catch (_) {}
-    serverQueue.current = null;
-
-    serverQueue.player.stop(true);
-    logAndReply(message, 'Skipping to the next song.');
+    const state = guildQueues.get(message.guild.id);
+    if (!state?.nowPlaying) return logAndReply(message, 'There is no song currently playing to skip!');
+    state.current?.cleanup();
+    state.player.stop(true);
+    return logAndReply(message, 'Skipping to the next song.');
   }
 
   if (command === 'leave' || command === 'l') {
-    const serverQueue = queue.get(message.guild.id);
-    if (!serverQueue) return logAndReply(message, 'I am not in a voice channel.');
-
-    clearInactivityTimeout(message.guild.id);
-
-    try {
-      serverQueue.current?.cleanup?.();
-    } catch (_) {}
-    serverQueue.current = null;
-
-    serverQueue.connection.destroy();
-    queue.delete(message.guild.id);
-    logAndReply(message, 'I have left the voice channel and cleared the queue!');
+    if (!guildQueues.has(message.guild.id)) return logAndReply(message, 'I am not in a voice channel.');
+    destroyQueue(message.guild.id);
+    return logAndReply(message, 'I have left the voice channel and cleared the queue!');
   }
 
   if (command === 'shuffle') {
-    const serverQueue = queue.get(message.guild.id);
-    if (!serverQueue || serverQueue.songs.length === 0) {
-      return logAndReply(message, 'The queue is empty, nothing to shuffle.');
-    }
-
-    for (let i = serverQueue.songs.length - 1; i > 0; i--) {
+    const state = guildQueues.get(message.guild.id);
+    if (!state?.songs.length) return logAndReply(message, 'The queue is empty, nothing to shuffle.');
+    for (let i = state.songs.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [serverQueue.songs[i], serverQueue.songs[j]] = [serverQueue.songs[j], serverQueue.songs[i]];
+      [state.songs[i], state.songs[j]] = [state.songs[j], state.songs[i]];
     }
-
-    logAndReply(message, 'Queue shuffled!');
+    return logAndReply(message, 'Queue shuffled!');
   }
 
   if (command === 'queue' || command === 'q') {
-    const serverQueue = queue.get(message.guild.id);
-    if (!serverQueue || serverQueue.songs.length === 0) {
-      return logAndReply(message, 'The queue is currently empty.');
-    }
-
-    let queueList = 'Current Queue:\n';
-    serverQueue.songs.forEach((song, index) => {
-      queueList += `${index + 1}. ${song.title}\n`;
-    });
-
-    logAndReply(message, queueList);
+    const state = guildQueues.get(message.guild.id);
+    if (!state?.songs.length) return logAndReply(message, 'The queue is currently empty.');
+    return logAndReply(message, `Current Queue:\n${state.songs.map((song, i) => `${i + 1}. ${song.title}`).join('\n')}`);
   }
 
   if (command === 'playing' || command === 'np') {
-    if (!currentPlaying) return logAndReply(message, 'No song is currently playing.');
-    logAndReply(message, `🎶 Now playing: **${currentPlaying}**`);
+    const song = guildQueues.get(message.guild.id)?.nowPlaying;
+    if (!song) return logAndReply(message, 'No song is currently playing.');
+    return logAndReply(message, `🎶 Now playing: **${song.title}**`);
   }
 
   if (command === 'help' || command === 'h') {
-    logAndReply(
-      message,
+    return logAndReply(message,
       '**Commands List:**\n' +
-        '`-play <URL>` or `-p <URL>` - Plays the requested song\n' +
-        '`-skip` or `-s` - Skips the current song\n' +
-        '`-leave` or `-l` - Disconnects bot from the voice channel\n' +
-        '`-shuffle` - Shuffles the current queue\n' +
-        '`-queue` or `-q` - Lists the current queue\n' +
-        '`-playing` or `-np` - Displays the current song title\n' +
-        '`-help` or `-h` - Displays this help message'
-    );
+      '`-play <URL>` or `-p <URL>` - Plays the requested song\n' +
+      '`-skip` or `-s` - Skips the current song\n' +
+      '`-leave` or `-l` - Disconnects bot from the voice channel\n' +
+      '`-shuffle` - Shuffles the current queue\n' +
+      '`-queue` or `-q` - Lists the current queue\n' +
+      '`-playing` or `-np` - Displays the current song title\n' +
+      '`-help` or `-h` - Displays this help message');
   }
 });
 
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
+client.once('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
+client.on('error', (error) => console.error('Discord client error:', error));
+process.on('SIGINT', () => { guildQueues.forEach((_, id) => destroyQueue(id)); client.destroy(); process.exit(0); });
+process.on('SIGTERM', () => { guildQueues.forEach((_, id) => destroyQueue(id)); client.destroy(); process.exit(0); });
 
-client.login(token);
+client.login(readToken()).catch((error) => {
+  console.error('Discord login failed:', error.message);
+  process.exitCode = 1;
+});

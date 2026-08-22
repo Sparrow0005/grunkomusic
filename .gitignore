@@ -5,6 +5,8 @@ cookies.txt
 # Node.js specific files
 node_modules/
 npm-debug.log
+bot.log
+bot-error.log
 
 # OS-specific files
 .DS_Store
