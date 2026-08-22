@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
+const { PassThrough } = require('node:stream');
 const { Client, GatewayIntentBits } = require('discord.js');
 const {
   AudioPlayerStatus,
@@ -17,8 +18,18 @@ const config = require('./config');
 
 const prefix = '-';
 const guildQueues = new Map();
+const guildQueueInitializations = new Map();
 let ytdlpUpdatePromise = null;
-let lastYtdlpUpdateAttempt = 0;
+
+function readLastYtdlpUpdateAttempt() {
+  try {
+    return JSON.parse(fs.readFileSync(config.maintenanceStatePath, 'utf8')).lastYtdlpUpdateAttempt || 0;
+  } catch {
+    return 0;
+  }
+}
+
+let lastYtdlpUpdateAttempt = readLastYtdlpUpdateAttempt();
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -34,11 +45,82 @@ function suggestsYtdlpUpdate(error) {
   return /signature|nsig|extractor|player response|requested format is not available|unable to extract/i.test(errorText(error));
 }
 
+function isCookieError(error) {
+  return /cookie|log[ -]?in|sign in|authentication|account.*required|confirm you('| a)re not a bot|po token/i.test(errorText(error));
+}
+
+function cookieFileSignature() {
+  try {
+    const stat = fs.statSync(config.cookiesFilePath);
+    return `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
+function readCookieHealth() {
+  try {
+    return JSON.parse(fs.readFileSync(config.cookieHealthStatePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+let cookieHealth = readCookieHealth();
+
+function writeCookieHealth() {
+  try {
+    fs.writeFileSync(config.cookieHealthStatePath, JSON.stringify(cookieHealth, null, 2));
+  } catch (error) {
+    console.error('[RECOVERY] Could not persist cookie health:', errorText(error));
+  }
+}
+
+function cookiesAreUsable() {
+  const signature = cookieFileSignature();
+  if (!signature) return false;
+  if (cookieHealth.unhealthySignature && cookieHealth.unhealthySignature !== signature) {
+    console.log('[RECOVERY] A replacement cookies.txt was detected; cookies are active again.');
+    cookieHealth = {};
+    writeCookieHealth();
+  }
+  return cookieHealth.unhealthySignature !== signature;
+}
+
+function cookieStatus() {
+  if (!cookieFileSignature()) return 'missing';
+  return cookiesAreUsable() ? 'active' : 'expired';
+}
+
+function markCookiesUnhealthy(error) {
+  const signature = cookieFileSignature();
+  if (!signature) return;
+  cookieHealth.unhealthySignature = signature;
+  cookieHealth.lastFailure = new Date().toISOString();
+  cookieHealth.lastError = errorText(error).slice(0, 500);
+  writeCookieHealth();
+  console.error('[RECOVERY] cookies.txt appears expired or rejected; public playback will fall back to cookie-free mode.');
+}
+
+async function warnAboutExpiredCookies(message) {
+  if (cookieStatus() !== 'expired') return;
+  if (cookieHealth.lastWarningAt &&
+      Date.now() - cookieHealth.lastWarningAt < config.cookieWarningCooldown) return;
+  cookieHealth.lastWarningAt = Date.now();
+  writeCookieHealth();
+  await logAndReply(message, 'YouTube login cookies appear to be expired. I’ll still try public videos, but restricted videos need a refreshed `cookies.txt`.');
+}
+
 async function updateYtdlp(reason = 'scheduled maintenance', force = false) {
   const now = Date.now();
   if (!force && now - lastYtdlpUpdateAttempt < config.ytdlpUpdateCooldown) return false;
   if (ytdlpUpdatePromise) return ytdlpUpdatePromise;
   lastYtdlpUpdateAttempt = now;
+  try {
+    fs.writeFileSync(config.maintenanceStatePath, JSON.stringify({ lastYtdlpUpdateAttempt }, null, 2));
+  } catch (error) {
+    console.error('[RECOVERY] Could not persist yt-dlp maintenance state:', errorText(error));
+  }
   console.log(`[RECOVERY] Checking yt-dlp for updates: ${reason}`);
   ytdlpUpdatePromise = ytdlp.exec('--update')
     .then(() => {
@@ -90,20 +172,47 @@ function logAndReply(message, content) {
   return message.reply(content).catch((error) => console.error('Could not reply in Discord:', error));
 }
 
-function ytdlpOptions() {
-  return fs.existsSync(config.cookiesFilePath) ? { cookies: config.cookiesFilePath } : {};
+async function sendQueue(message, songs) {
+  const pages = [];
+  let page = 'Current Queue:\n';
+  songs.forEach((song, index) => {
+    const line = `${index + 1}. ${song.title}\n`;
+    if (page.length + line.length > 1900) {
+      pages.push(page.trimEnd());
+      page = `Current Queue (continued):\n${line}`;
+    } else {
+      page += line;
+    }
+  });
+  if (page.trim()) pages.push(page.trimEnd());
+  await logAndReply(message, pages[0]);
+  for (const continuation of pages.slice(1)) await logAndSend(message.channel, continuation);
+}
+
+function ytdlpOptions(useCookies = true) {
+  return useCookies && cookiesAreUsable() ? { cookies: config.cookiesFilePath } : {};
 }
 
 async function resolveSong(url) {
   const parsed = new URL(url);
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
-  const info = await withRecovery(() => ytdlp(url, {
-    dumpSingleJson: true,
-    noPlaylist: true,
-    noWarnings: true,
-    socketTimeout: 15,
-    ...ytdlpOptions(),
-  }), { label: 'YouTube metadata lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
+  const usedCookies = cookiesAreUsable();
+  const lookup = (useCookies) => withRecovery(() => ytdlp(url, {
+      dumpSingleJson: true,
+      noPlaylist: true,
+      noWarnings: true,
+      socketTimeout: 15,
+      ...ytdlpOptions(useCookies),
+    }), { label: 'YouTube metadata lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
+  let info;
+  try {
+    info = await lookup(usedCookies);
+  } catch (error) {
+    if (!usedCookies || !isCookieError(error)) throw error;
+    markCookiesUnhealthy(error);
+    console.log('[RECOVERY] Retrying metadata lookup without cookies.');
+    info = await lookup(false);
+  }
   return { url, title: info.title || 'Unknown title' };
 }
 
@@ -111,6 +220,8 @@ function createAudioPipeline(url) {
   let intentionalShutdown = false;
   let downloadErrors = '';
   let ffmpegErrors = '';
+  const output = new PassThrough();
+  const usedCookies = cookiesAreUsable();
   const download = ytdlp.exec(url, {
     format: 'bestaudio/best',
     output: '-',
@@ -120,7 +231,7 @@ function createAudioPipeline(url) {
     retries: 3,
     fragmentRetries: 3,
     socketTimeout: 15,
-    ...ytdlpOptions(),
+    ...ytdlpOptions(usedCookies),
   }, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   const ffmpeg = spawn(ffmpegPath, [
@@ -129,6 +240,7 @@ function createAudioPipeline(url) {
   ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
 
   download.stdout.pipe(ffmpeg.stdin);
+  ffmpeg.stdout.pipe(output);
   download.stderr.on('data', (data) => {
     downloadErrors = `${downloadErrors}${data}`.slice(-8000);
     console.error(`yt-dlp: ${data.toString().trim()}`);
@@ -137,16 +249,16 @@ function createAudioPipeline(url) {
     ffmpegErrors = `${ffmpegErrors}${data}`.slice(-8000);
     console.error(`ffmpeg: ${data.toString().trim()}`);
   });
-  download.on('error', (error) => { if (!intentionalShutdown) ffmpeg.stdout.destroy(error); });
-  ffmpeg.on('error', (error) => { if (!intentionalShutdown) ffmpeg.stdout.destroy(error); });
+  download.on('error', (error) => { if (!intentionalShutdown) output.destroy(error); });
+  ffmpeg.on('error', (error) => { if (!intentionalShutdown) output.destroy(error); });
   download.on('close', (code) => {
     if (!intentionalShutdown && code !== 0) {
-      ffmpeg.stdout.destroy(new Error(`yt-dlp exited with code ${code}: ${downloadErrors}`));
+      output.destroy(new Error(`yt-dlp exited with code ${code}: ${downloadErrors}`));
     }
   });
   ffmpeg.on('close', (code) => {
     if (!intentionalShutdown && code !== 0) {
-      ffmpeg.stdout.destroy(new Error(`FFmpeg exited with code ${code}: ${ffmpegErrors}`));
+      output.destroy(new Error(`FFmpeg exited with code ${code}: ${ffmpegErrors}`));
     }
   });
 
@@ -156,11 +268,13 @@ function createAudioPipeline(url) {
     closed = true;
     intentionalShutdown = true;
     download.stdout?.unpipe(ffmpeg.stdin);
+    ffmpeg.stdout?.unpipe(output);
+    output.destroy();
     download.kill();
     ffmpeg.kill();
   };
 
-  return { stream: ffmpeg.stdout, cleanup };
+  return { stream: output, cleanup, usedCookies };
 }
 
 function clearIdleTimer(state) {
@@ -196,8 +310,12 @@ async function playNext(guildId) {
 
   try {
     const pipeline = createAudioPipeline(song.url);
-    state.current = pipeline;
-    state.player.play(createAudioResource(pipeline.stream, { inputType: StreamType.Raw }));
+    const generation = Symbol('playback');
+    state.current = { ...pipeline, generation };
+    state.player.play(createAudioResource(pipeline.stream, {
+      inputType: StreamType.Raw,
+      metadata: { generation },
+    }));
     await logAndSend(state.textChannel, `🎶 Now playing: **${song.title}**`);
   } catch (error) {
     console.error('Could not start playback:', error);
@@ -206,9 +324,10 @@ async function playNext(guildId) {
   }
 }
 
-function finishCurrent(guildId) {
+function finishCurrent(guildId, generation = null) {
   const state = guildQueues.get(guildId);
   if (!state) return;
+  if (generation && state.current?.generation !== generation) return;
   state.current?.cleanup();
   state.current = null;
   state.playing = false;
@@ -216,7 +335,7 @@ function finishCurrent(guildId) {
   setImmediate(() => playNext(guildId));
 }
 
-async function getOrCreateQueue(message) {
+async function initializeQueue(message) {
   const guildId = message.guild.id;
   let state = guildQueues.get(guildId);
   if (state) return state;
@@ -250,11 +369,24 @@ async function getOrCreateQueue(message) {
     connection, player, songs: [], playing: false, nowPlaying: null,
     current: null, textChannel: message.channel, idleTimer: null,
   };
-  player.on(AudioPlayerStatus.Idle, () => finishCurrent(guildId));
+  player.on('stateChange', (oldState, newState) => {
+    if (newState.status === AudioPlayerStatus.Playing) clearIdleTimer(state);
+    if (newState.status === AudioPlayerStatus.Paused || newState.status === AudioPlayerStatus.AutoPaused) {
+      scheduleDisconnect(guildId);
+    }
+    if (newState.status === AudioPlayerStatus.Idle && oldState.resource) {
+      finishCurrent(guildId, oldState.resource.metadata?.generation);
+    }
+  });
   player.on('error', (error) => {
     console.error('Playback error:', error);
+    const generation = error.resource?.metadata?.generation;
+    if (generation && state.current?.generation !== generation) return;
     const song = state.nowPlaying;
-    if (!song) return finishCurrent(guildId);
+    if (!song) return finishCurrent(guildId, generation);
+    if (state.current?.usedCookies && isCookieError(error)) {
+      markCookiesUnhealthy(error);
+    }
     song.playbackAttempts = (song.playbackAttempts || 0) + 1;
     if (!isPermanentMediaError(error) && song.playbackAttempts <= config.playbackRetries) {
       console.log(`[RECOVERY] Re-queueing ${song.title} after playback failure (${song.playbackAttempts}/${config.playbackRetries}).`);
@@ -264,7 +396,7 @@ async function getOrCreateQueue(message) {
     } else {
       logAndSend(state.textChannel, `I couldn't recover **${song.title}**, so I'm skipping it.`);
     }
-    finishCurrent(guildId);
+    finishCurrent(guildId, generation);
   });
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
@@ -279,6 +411,22 @@ async function getOrCreateQueue(message) {
   connection.subscribe(player);
   guildQueues.set(guildId, state);
   return state;
+}
+
+async function getOrCreateQueue(message) {
+  const guildId = message.guild.id;
+  const existing = guildQueues.get(guildId);
+  if (existing) return existing;
+  const pending = guildQueueInitializations.get(guildId);
+  if (pending) return pending;
+
+  const initialization = initializeQueue(message).finally(() => {
+    if (guildQueueInitializations.get(guildId) === initialization) {
+      guildQueueInitializations.delete(guildId);
+    }
+  });
+  guildQueueInitializations.set(guildId, initialization);
+  return initialization;
 }
 
 const client = new Client({
@@ -299,11 +447,16 @@ client.on('messageCreate', async (message) => {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
     const url = args[0];
     if (!url) return logAndReply(message, 'You need to provide a YouTube URL to play a song!');
+    await warnAboutExpiredCookies(message);
     let song;
     try {
       song = await resolveSong(url);
+      await warnAboutExpiredCookies(message);
     } catch (error) {
       console.error('Error processing video:', error);
+      if (isCookieError(error) && cookieStatus() !== 'active') {
+        return logAndReply(message, `This video needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+      }
       return logAndReply(message, 'There was an error trying to play the video.');
     }
 
@@ -316,6 +469,9 @@ client.on('messageCreate', async (message) => {
     }
 
     state.textChannel = message.channel;
+    if (state.songs.length >= config.maxQueueSize) {
+      return logAndReply(message, `The queue is full (${config.maxQueueSize} songs). Try again later.`);
+    }
     state.songs.push({ ...song, playbackAttempts: 0 });
     await logAndReply(message, `Added to the queue: ${song.title}`);
     playNext(message.guild.id);
@@ -348,13 +504,23 @@ client.on('messageCreate', async (message) => {
   if (command === 'queue' || command === 'q') {
     const state = guildQueues.get(message.guild.id);
     if (!state?.songs.length) return logAndReply(message, 'The queue is currently empty.');
-    return logAndReply(message, `Current Queue:\n${state.songs.map((song, i) => `${i + 1}. ${song.title}`).join('\n')}`);
+    return sendQueue(message, state.songs);
   }
 
   if (command === 'playing' || command === 'np') {
     const song = guildQueues.get(message.guild.id)?.nowPlaying;
     if (!song) return logAndReply(message, 'No song is currently playing.');
     return logAndReply(message, `🎶 Now playing: **${song.title}**`);
+  }
+
+  if (command === 'health') {
+    const status = cookieStatus();
+    const cookieMessage = status === 'active'
+      ? 'YouTube cookies are active.'
+      : status === 'expired'
+        ? 'YouTube cookies appear expired; public-video fallback is active.'
+        : 'YouTube cookies are missing; public videos may still work.';
+    return logAndReply(message, `Music systems are online. ${cookieMessage}`);
   }
 
   if (command === 'help' || command === 'h') {
@@ -366,13 +532,14 @@ client.on('messageCreate', async (message) => {
       '`-shuffle` - Shuffles the current queue\n' +
       '`-queue` or `-q` - Lists the current queue\n' +
       '`-playing` or `-np` - Displays the current song title\n' +
+      '`-health` - Displays playback and YouTube cookie health\n' +
       '`-help` or `-h` - Displays this help message');
   }
 });
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
-  updateYtdlp('startup maintenance', true);
+  updateYtdlp('startup maintenance');
   setInterval(() => updateYtdlp('scheduled daily maintenance'), config.ytdlpUpdateInterval).unref();
 });
 client.on('error', (error) => console.error('Discord client error:', error));

@@ -1,6 +1,8 @@
 # Ignore sensitive files
 token.txt
 cookies.txt
+maintenance-state.json
+cookie-health.json
 
 # Node.js specific files
 node_modules/
