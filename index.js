@@ -44,8 +44,13 @@ function errorText(error) {
   return [error?.message, error?.stderr, error?.cause?.message].filter(Boolean).join('\n');
 }
 
+function isExpectedPipeError(error) {
+  return ['EPIPE', 'EOF', 'ERR_STREAM_PREMATURE_CLOSE'].includes(error?.code) ||
+    /write epipe|premature close|broken pipe/i.test(errorText(error));
+}
+
 function isPermanentMediaError(error) {
-  return /private video|video unavailable|removed by the uploader|copyright|members-only|sign in to confirm your age|unsupported url|invalid url/i.test(errorText(error));
+  return /private video|video unavailable|video is not available|removed by the uploader|copyright|members-only|unsupported url|invalid url/i.test(errorText(error));
 }
 
 function suggestsYtdlpUpdate(error) {
@@ -53,7 +58,7 @@ function suggestsYtdlpUpdate(error) {
 }
 
 function isCookieError(error) {
-  return /cookie|log[ -]?in|sign in|authentication|account.*required|confirm you('| a)re not a bot|po token/i.test(errorText(error));
+  return /cookie|log[ -]?in|sign in|authentication|account.*required|confirm you('| a)re not a bot|po token|page needs to be reloaded/i.test(errorText(error));
 }
 
 function cookieFileSignature() {
@@ -231,8 +236,24 @@ function ytdlpOptions(useCookies = true) {
   return useCookies && cookiesAreUsable() ? { cookies: config.cookiesFilePath } : {};
 }
 
+function youtubeMusicAccessOptions(enabled = false) {
+  if (!enabled) return {};
+  return {
+    jsRuntimes: `node:${process.execPath}`,
+    remoteComponents: 'ejs:github',
+    extractorArgs: 'youtube:player_client=web_music',
+  };
+}
+
+function sanitizeUrlInput(input) {
+  let value = String(input || '').trim();
+  if (value.startsWith('<') && value.endsWith('>')) value = value.slice(1, -1);
+  value = value.replace(/^(?:\*\*|__|~~|`)+/, '').replace(/(?:\*\*|__|~~|`)+$/, '');
+  return value;
+}
+
 function normalizeMediaUrl(input) {
-  const parsed = new URL(input);
+  const parsed = new URL(sanitizeUrlInput(input));
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
 
   const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
@@ -256,7 +277,7 @@ function normalizeMediaUrl(input) {
 }
 
 function normalizePlaylistUrl(input) {
-  const parsed = new URL(input);
+  const parsed = new URL(sanitizeUrlInput(input));
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL');
   const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
   const youtubeHosts = new Set(['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
@@ -274,7 +295,7 @@ function normalizePlaylistUrl(input) {
 
 function containsYouTubePlaylist(input) {
   try {
-    const parsed = new URL(input);
+    const parsed = new URL(sanitizeUrlInput(input));
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
     return ['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(hostname) &&
       Boolean(parsed.searchParams.get('list'));
@@ -285,7 +306,7 @@ function containsYouTubePlaylist(input) {
 
 async function resolvePlaylist(url, maxEntries) {
   const normalizedUrl = normalizePlaylistUrl(url);
-  const usedCookies = cookiesAreUsable();
+  const cookiesAvailable = cookiesAreUsable();
   const lookup = (useCookies) => withRecovery(() => ytdlp(normalizedUrl, {
       dumpSingleJson: true,
       flatPlaylist: true,
@@ -296,13 +317,19 @@ async function resolvePlaylist(url, maxEntries) {
     }), { label: 'YouTube playlist lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
 
   let info;
+  let requiresCookies = false;
   try {
-    info = await lookup(usedCookies);
-  } catch (error) {
-    if (!usedCookies || !isCookieError(error)) throw error;
-    markCookiesUnhealthy(error);
-    console.log('[RECOVERY] Retrying playlist lookup without cookies.');
     info = await lookup(false);
+  } catch (error) {
+    if (!cookiesAvailable || !isCookieError(error)) throw error;
+    console.log('[RECOVERY] Playlist needs authentication; retrying with cookies.');
+    try {
+      info = await lookup(true);
+      requiresCookies = true;
+    } catch (cookieError) {
+      if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
+      throw cookieError;
+    }
   }
 
   const songs = (info.entries || [])
@@ -313,6 +340,11 @@ async function resolvePlaylist(url, maxEntries) {
       url: `https://www.youtube.com/watch?v=${entry.id}`,
       title: entry.title || 'Unknown title',
       playbackAttempts: 0,
+      requiresCookies,
+      sourcePlaylist: info.title || null,
+      sourceChannel: entry.channel || entry.uploader || null,
+      youtubeMusicFallback: /\s*-\s*Topic\s*$/i.test(entry.channel || entry.uploader || ''),
+      youtubeMusicFallbackAttempted: /\s*-\s*Topic\s*$/i.test(entry.channel || entry.uploader || ''),
     }));
 
   return { title: info.title || 'YouTube playlist', songs };
@@ -320,32 +352,119 @@ async function resolvePlaylist(url, maxEntries) {
 
 async function resolveSong(url) {
   const normalizedUrl = normalizeMediaUrl(url);
-  const usedCookies = cookiesAreUsable();
-  const lookup = (useCookies) => withRecovery(() => ytdlp(normalizedUrl, {
+  const cookiesAvailable = cookiesAreUsable();
+  const lookup = (useCookies, useYouTubeMusic = false) => withRecovery(() => ytdlp(normalizedUrl, {
       dumpSingleJson: true,
       noPlaylist: true,
       noWarnings: true,
       socketTimeout: 15,
+      ...(useYouTubeMusic ? { format: 'bestaudio/best' } : {}),
+      ...youtubeMusicAccessOptions(useYouTubeMusic),
       ...ytdlpOptions(useCookies),
     }), { label: 'YouTube metadata lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
   let info;
+  let requiresCookies = false;
+  let youtubeMusicFallback = false;
+  let triedYouTubeMusic = false;
   try {
-    info = await lookup(usedCookies);
-  } catch (error) {
-    if (!usedCookies || !isCookieError(error)) throw error;
-    markCookiesUnhealthy(error);
-    console.log('[RECOVERY] Retrying metadata lookup without cookies.');
     info = await lookup(false);
+  } catch (error) {
+    if (isPermanentMediaError(error)) {
+      triedYouTubeMusic = true;
+      try {
+        console.log('[RECOVERY] Standard YouTube access unavailable; trying the YouTube Music client.');
+        info = await lookup(false, true);
+        youtubeMusicFallback = true;
+      } catch (musicError) {
+        error = musicError;
+      }
+    }
+    if (!info) {
+      if (!cookiesAvailable || !isCookieError(error)) throw error;
+      console.log('[RECOVERY] Video needs authentication; retrying with cookies.');
+      try {
+        info = await lookup(true, triedYouTubeMusic);
+        requiresCookies = true;
+        youtubeMusicFallback = triedYouTubeMusic;
+      } catch (cookieError) {
+        if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
+        throw cookieError;
+      }
+    }
   }
-  return { url: normalizedUrl, title: info.title || 'Unknown title' };
+  return {
+    url: normalizedUrl,
+    title: info.title || 'Unknown title',
+    duration: Number(info.duration) || null,
+    sourceChannel: info.channel || info.uploader || null,
+    requiresCookies,
+    youtubeMusicFallback,
+    youtubeMusicFallbackAttempted: youtubeMusicFallback,
+  };
 }
 
-function createAudioPipeline(url) {
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\s*-\s*topic\s*$/i, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function isContextualReplacement(song, candidate) {
+  const targetTitle = normalizeSearchText(song.title);
+  const candidateTitle = normalizeSearchText(candidate.title);
+  if (!targetTitle || !candidateTitle.includes(targetTitle)) return false;
+
+  const sourceArtist = normalizeSearchText(song.sourceChannel);
+  if (!sourceArtist) return true;
+  const candidateArtist = normalizeSearchText(candidate.sourceChannel);
+  return candidateArtist.includes(sourceArtist) || candidateTitle.includes(sourceArtist);
+}
+
+async function findPlayableReplacement(song) {
+  const originalId = new URL(song.url).searchParams.get('v');
+  const sourceArtist = String(song.sourceChannel || '').replace(/\s*-\s*Topic\s*$/i, '').trim();
+  const context = [song.title, sourceArtist, song.sourcePlaylist].filter(Boolean).join(' ');
+  let search;
+  try {
+    search = await withRecovery(() => ytdlp(`ytsearch10:${context}`, {
+      dumpSingleJson: true,
+      flatPlaylist: true,
+      playlistEnd: 10,
+      noWarnings: true,
+      socketTimeout: 15,
+    }), { label: 'replacement search', retries: 1, allowYtdlpUpdate: true });
+  } catch (error) {
+    console.error('[RECOVERY] Replacement search failed:', errorText(error));
+    return null;
+  }
+
+  for (const entry of (search.entries || []).slice(0, 10)) {
+    if (!entry?.id || entry.id === originalId || !/^[A-Za-z0-9_-]{11}$/.test(entry.id)) continue;
+    const searchCandidate = {
+      title: entry.title || '',
+      sourceChannel: entry.channel || entry.uploader || null,
+    };
+    if (!isContextualReplacement(song, searchCandidate)) continue;
+    try {
+      const replacement = await resolveSong(`https://www.youtube.com/watch?v=${entry.id}`);
+      if (replacement.duration && replacement.duration > 20 * 60) continue;
+      if (!isContextualReplacement(song, replacement)) continue;
+      return { ...replacement, playbackAttempts: 0, replacementAttempted: true };
+    } catch (error) {
+      console.error(`[RECOVERY] Replacement candidate ${entry.id} was not playable:`, errorText(error));
+    }
+  }
+  return null;
+}
+
+function createAudioPipeline(url, requiresCookies = false, youtubeMusicFallback = false) {
   let intentionalShutdown = false;
   let downloadErrors = '';
   let ffmpegErrors = '';
   const output = new PassThrough();
-  const usedCookies = cookiesAreUsable();
+  const usedCookies = requiresCookies && cookiesAreUsable();
   const download = ytdlp.exec(url, {
     format: 'bestaudio/best',
     output: '-',
@@ -355,6 +474,7 @@ function createAudioPipeline(url) {
     retries: 3,
     fragmentRetries: 3,
     socketTimeout: 15,
+    ...youtubeMusicAccessOptions(youtubeMusicFallback),
     ...ytdlpOptions(usedCookies),
   }, { stdio: ['ignore', 'pipe', 'pipe'] });
   download.catch((error) => {
@@ -372,6 +492,16 @@ function createAudioPipeline(url) {
 
   download.stdout.pipe(ffmpeg.stdin);
   ffmpeg.stdout.pipe(output);
+  const handlePipeError = (label) => (error) => {
+    if (intentionalShutdown || isExpectedPipeError(error)) {
+      console.log(`[RECOVERY] Expected ${label} pipe closure.`);
+      return;
+    }
+    output.destroy(new Error(`${label} pipe failed: ${errorText(error).slice(0, 2000)}`));
+  };
+  download.stdout.on('error', handlePipeError('yt-dlp stdout'));
+  ffmpeg.stdin.on('error', handlePipeError('FFmpeg stdin'));
+  ffmpeg.stdout.on('error', handlePipeError('FFmpeg stdout'));
   download.stderr.on('data', (data) => {
     downloadErrors = `${downloadErrors}${data}`.slice(-8000);
     console.error(`yt-dlp: ${data.toString().trim()}`);
@@ -440,7 +570,7 @@ async function playNext(guildId) {
   state.nowPlaying = song;
 
   try {
-    const pipeline = createAudioPipeline(song.url);
+    const pipeline = createAudioPipeline(song.url, song.requiresCookies, song.youtubeMusicFallback);
     const generation = Symbol('playback');
     state.current = { ...pipeline, generation };
     state.player.play(createAudioResource(pipeline.stream, {
@@ -506,17 +636,54 @@ async function initializeQueue(message) {
       scheduleDisconnect(guildId);
     }
     if (newState.status === AudioPlayerStatus.Idle && oldState.resource) {
-      finishCurrent(guildId, oldState.resource.metadata?.generation);
+      const generation = oldState.resource.metadata?.generation;
+      if (state.recoveringGeneration !== generation) finishCurrent(guildId, generation);
     }
   });
-  player.on('error', (error) => {
-    console.error('Playback error:', error);
+  player.on('error', async (error) => {
+    console.error('Playback error:', errorText(error).slice(0, 4000));
     const generation = error.resource?.metadata?.generation;
     if (generation && state.current?.generation !== generation) return;
     const song = state.nowPlaying;
     if (!song) return finishCurrent(guildId, generation);
+    state.recoveringGeneration = generation;
+    const finishRecovery = () => {
+      if (state.recoveringGeneration === generation) state.recoveringGeneration = null;
+      finishCurrent(guildId, generation);
+    };
+    if (!state.current?.usedCookies && isCookieError(error) && cookiesAreUsable() && !song.cookieFallbackAttempted) {
+      song.cookieFallbackAttempted = true;
+      song.requiresCookies = true;
+      state.songs.unshift(song);
+      console.log(`[RECOVERY] ${song.title} needs authentication; retrying playback with cookies.`);
+      finishRecovery();
+      return;
+    }
     if (state.current?.usedCookies && isCookieError(error)) {
       markCookiesUnhealthy(error);
+    }
+    if (isPermanentMediaError(error) && !song.youtubeMusicFallbackAttempted) {
+      song.youtubeMusicFallbackAttempted = true;
+      song.youtubeMusicFallback = true;
+      state.songs.unshift(song);
+      await logAndSend(state.textChannel, `The standard stream for **${song.title}** is unavailable—trying YouTube Music access.`);
+      finishRecovery();
+      return;
+    }
+    if (isPermanentMediaError(error) && song.sourcePlaylist && !song.replacementAttempted) {
+      song.replacementAttempted = true;
+      const channelContext = song.sourceChannel ? ` from **${song.sourceChannel}**` : '';
+      await logAndSend(state.textChannel, `The original upload for **${song.title}**${channelContext} is unavailable—searching for the same artist and song.`);
+      const replacement = await findPlayableReplacement(song);
+      if (guildQueues.get(guildId) !== state || state.current?.generation !== generation) return;
+      if (replacement) {
+        state.songs.unshift(replacement);
+        await logAndSend(state.textChannel, `Found a playable replacement: **${replacement.title}**.`);
+      } else {
+        await logAndSend(state.textChannel, `I couldn't find a playable replacement for **${song.title}**, so I'm skipping it.`);
+      }
+      finishRecovery();
+      return;
     }
     song.playbackAttempts = (song.playbackAttempts || 0) + 1;
     if (!isPermanentMediaError(error) && song.playbackAttempts <= config.playbackRetries) {
@@ -527,7 +694,7 @@ async function initializeQueue(message) {
     } else {
       logAndSend(state.textChannel, `I couldn't recover **${song.title}**, so I'm skipping it.`);
     }
-    finishCurrent(guildId, generation);
+    finishRecovery();
   });
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
@@ -753,6 +920,10 @@ function shutdown(code = 0) {
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
 process.on('uncaughtException', (error) => {
+  if (isExpectedPipeError(error)) {
+    console.log(`[RECOVERY] Contained an expected pipe closure: ${errorText(error)}`);
+    return;
+  }
   console.error('[FATAL] Uncaught exception; watchdog will restart the bot:', error);
   shutdown(1);
 });
