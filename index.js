@@ -666,14 +666,14 @@ async function initializeQueue(message) {
       song.youtubeMusicFallbackAttempted = true;
       song.youtubeMusicFallback = true;
       state.songs.unshift(song);
-      await logAndSend(state.textChannel, `The standard stream for **${song.title}** is unavailable—trying YouTube Music access.`);
+      await logAndSend(state.textChannel, `The standard stream for **${song.title}** is unavailable--trying YouTube Music access.`);
       finishRecovery();
       return;
     }
     if (isPermanentMediaError(error) && song.sourcePlaylist && !song.replacementAttempted) {
       song.replacementAttempted = true;
       const channelContext = song.sourceChannel ? ` from **${song.sourceChannel}**` : '';
-      await logAndSend(state.textChannel, `The original upload for **${song.title}**${channelContext} is unavailable—searching for the same artist and song.`);
+      await logAndSend(state.textChannel, `The original upload for **${song.title}**${channelContext} is unavailable--searching for the same artist and song.`);
       const replacement = await findPlayableReplacement(song);
       if (guildQueues.get(guildId) !== state || state.current?.generation !== generation) return;
       if (replacement) {
@@ -689,7 +689,7 @@ async function initializeQueue(message) {
     if (!isPermanentMediaError(error) && song.playbackAttempts <= config.playbackRetries) {
       console.log(`[RECOVERY] Re-queueing ${song.title} after playback failure (${song.playbackAttempts}/${config.playbackRetries}).`);
       state.songs.unshift(song);
-      logAndSend(state.textChannel, `Playback hiccup—retrying **${song.title}**.`);
+      logAndSend(state.textChannel, `Playback hiccup--retrying **${song.title}**.`);
       if (suggestsYtdlpUpdate(error)) updateYtdlp('playback extractor failure');
     } else {
       logAndSend(state.textChannel, `I couldn't recover **${song.title}**, so I'm skipping it.`);
