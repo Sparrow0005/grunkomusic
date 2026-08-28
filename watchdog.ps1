@@ -17,9 +17,11 @@ while ($true) {
   $started = Get-Date -Format o
   Add-Content -LiteralPath $log -Value "[$started] [WATCHDOG] Starting bot."
   $runStarted = Get-Date
+  # Use cmd for byte-preserving append redirection, but explicitly hide its
+  # window so the watchdog never leaves a console on the desktop.
   $command = "`"$node`" `"$index`" 1>>`"$log`" 2>>`"$errorLog`""
-  & cmd.exe /d /s /c $command
-  $exitCode = $LASTEXITCODE
+  $process = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d', '/s', '/c', $command -WindowStyle Hidden -Wait -PassThru
+  $exitCode = $process.ExitCode
   $stopped = Get-Date -Format o
   if ($exitCode -eq 0) {
     Add-Content -LiteralPath $log -Value "[$stopped] [WATCHDOG] Bot stopped cleanly; watchdog is exiting."

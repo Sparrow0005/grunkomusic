@@ -61,6 +61,10 @@ function isCookieError(error) {
   return /cookie|log[ -]?in|sign in|authentication|account.*required|confirm you('| a)re not a bot|po token|page needs to be reloaded/i.test(errorText(error));
 }
 
+function isCookieRejectionError(error) {
+  return /cookies? (?:are|is|have been) (?:expired|invalid|rejected)|invalid cookies?|expired cookies?|authentication cookies? (?:are|is|have been) (?:expired|invalid|rejected)|login session (?:has )?expired|session cookies? (?:are|is|have been) (?:expired|invalid|rejected)|sign in to confirm you('| a)re not a bot|confirm you('| a)re not a bot|page needs to be reloaded/i.test(errorText(error));
+}
+
 function cookieFileSignature() {
   try {
     const stat = fs.statSync(config.cookiesFilePath);
@@ -327,7 +331,7 @@ async function resolvePlaylist(url, maxEntries) {
       info = await lookup(true);
       requiresCookies = true;
     } catch (cookieError) {
-      if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
+      if (isCookieRejectionError(cookieError)) markCookiesUnhealthy(cookieError);
       throw cookieError;
     }
   }
@@ -387,7 +391,7 @@ async function resolveSong(url) {
         requiresCookies = true;
         youtubeMusicFallback = triedYouTubeMusic;
       } catch (cookieError) {
-        if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
+        if (isCookieRejectionError(cookieError)) markCookiesUnhealthy(cookieError);
         throw cookieError;
       }
     }
@@ -471,8 +475,10 @@ function createAudioPipeline(url, requiresCookies = false, youtubeMusicFallback 
     noPlaylist: true,
     noWarnings: true,
     quiet: true,
-    retries: 3,
-    fragmentRetries: 3,
+    retries: config.downloadRetries,
+    fragmentRetries: config.downloadRetries,
+    fileAccessRetries: config.downloadRetries,
+    retrySleep: 'http:linear=1::5',
     socketTimeout: 15,
     ...youtubeMusicAccessOptions(youtubeMusicFallback),
     ...ytdlpOptions(usedCookies),
@@ -562,7 +568,7 @@ function scheduleDisconnect(guildId) {
 async function playNext(guildId) {
   const state = guildQueues.get(guildId);
   if (!state || state.playing) return;
-  const song = state.songs.shift();
+  let song = state.songs.shift();
   if (!song) return scheduleDisconnect(guildId);
 
   clearIdleTimer(state);
@@ -570,9 +576,38 @@ async function playNext(guildId) {
   state.nowPlaying = song;
 
   try {
+    if (song.sourcePlaylist && !song.metadataValidated) {
+      try {
+        const resolved = await resolveSong(song.url);
+        song = {
+          ...song,
+          ...resolved,
+          sourcePlaylist: song.sourcePlaylist,
+          sourceChannel: resolved.sourceChannel || song.sourceChannel,
+          metadataValidated: true,
+        };
+        state.nowPlaying = song;
+      } catch (error) {
+        console.error(`[RECOVERY] Playlist entry validation failed for ${song.title}:`, errorText(error));
+        if (!song.replacementAttempted) {
+          song.replacementAttempted = true;
+          const replacement = await findPlayableReplacement(song);
+          if (replacement) {
+            state.songs.unshift({ ...replacement, metadataValidated: true });
+            await logAndSend(state.textChannel, `The original **${song.title}** is unavailable. Found a playable replacement: **${replacement.title}**.`);
+          } else {
+            await logAndSend(state.textChannel, `The playlist entry **${song.title}** is unavailable, so I'm skipping it.`);
+          }
+        }
+        state.playing = false;
+        state.nowPlaying = null;
+        setImmediate(() => playNext(guildId));
+        return;
+      }
+    }
     const pipeline = createAudioPipeline(song.url, song.requiresCookies, song.youtubeMusicFallback);
     const generation = Symbol('playback');
-    state.current = { ...pipeline, generation };
+    state.current = { ...pipeline, generation, startedAt: Date.now(), intentionalStop: false };
     state.player.play(createAudioResource(pipeline.stream, {
       inputType: StreamType.Raw,
       metadata: { generation },
@@ -637,7 +672,21 @@ async function initializeQueue(message) {
     }
     if (newState.status === AudioPlayerStatus.Idle && oldState.resource) {
       const generation = oldState.resource.metadata?.generation;
-      if (state.recoveringGeneration !== generation) finishCurrent(guildId, generation);
+      if (state.recoveringGeneration === generation) return;
+      const current = state.current;
+      const song = state.nowPlaying;
+      const elapsedSeconds = current?.startedAt ? (Date.now() - current.startedAt) / 1000 : null;
+      const endedEarly = !current?.intentionalStop && song?.duration && elapsedSeconds !== null &&
+        elapsedSeconds < song.duration - Math.max(15, song.duration * 0.05);
+      if (endedEarly && (song.playbackAttempts || 0) < config.playbackRetries) {
+        song.playbackAttempts = (song.playbackAttempts || 0) + 1;
+        state.songs.unshift(song);
+        console.error(`[RECOVERY] Stream for ${song.title} ended after ${elapsedSeconds.toFixed(1)}s of ${song.duration}s; retrying (${song.playbackAttempts}/${config.playbackRetries}).`);
+        logAndSend(state.textChannel, `Playback ended early--retrying **${song.title}**.`);
+      } else if (elapsedSeconds !== null) {
+        console.log(`[PLAYBACK] ${song?.title || 'Unknown title'} ended after ${elapsedSeconds.toFixed(1)}s${song?.duration ? ` (expected ${song.duration}s)` : ''}.`);
+      }
+      finishCurrent(guildId, generation);
     }
   });
   player.on('error', async (error) => {
@@ -659,7 +708,7 @@ async function initializeQueue(message) {
       finishRecovery();
       return;
     }
-    if (state.current?.usedCookies && isCookieError(error)) {
+    if (state.current?.usedCookies && isCookieRejectionError(error)) {
       markCookiesUnhealthy(error);
     }
     if (isPermanentMediaError(error) && !song.youtubeMusicFallbackAttempted) {
@@ -823,6 +872,7 @@ client.on('messageCreate', async (message) => {
     const state = guildQueues.get(message.guild.id);
     if (!state?.nowPlaying) return logAndReply(message, 'There is no song currently playing to skip!');
     const generation = state.current?.generation;
+    if (state.current) state.current.intentionalStop = true;
     state.current?.cleanup();
     state.player.stop(true);
     finishCurrent(message.guild.id, generation);
