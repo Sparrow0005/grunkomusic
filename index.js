@@ -240,11 +240,17 @@ function ytdlpOptions(useCookies = true) {
   return useCookies && cookiesAreUsable() ? { cookies: config.cookiesFilePath } : {};
 }
 
-function youtubeMusicAccessOptions(enabled = false) {
-  if (!enabled) return {};
+function youtubeChallengeOptions() {
   return {
     jsRuntimes: `node:${process.execPath}`,
     remoteComponents: 'ejs:github',
+  };
+}
+
+function youtubeMusicAccessOptions(enabled = false) {
+  if (!enabled) return {};
+  return {
+    ...youtubeChallengeOptions(),
     extractorArgs: 'youtube:player_client=web_music',
   };
 }
@@ -317,6 +323,7 @@ async function resolvePlaylist(url, maxEntries) {
       playlistEnd: maxEntries,
       noWarnings: true,
       socketTimeout: 15,
+      ...youtubeChallengeOptions(),
       ...ytdlpOptions(useCookies),
     }), { label: 'YouTube playlist lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
 
@@ -363,6 +370,7 @@ async function resolveSong(url) {
       noWarnings: true,
       socketTimeout: 15,
       ...(useYouTubeMusic ? { format: 'bestaudio/best' } : {}),
+      ...youtubeChallengeOptions(),
       ...youtubeMusicAccessOptions(useYouTubeMusic),
       ...ytdlpOptions(useCookies),
     }), { label: 'YouTube metadata lookup', retries: config.metadataRetries, allowYtdlpUpdate: true });
@@ -480,6 +488,7 @@ function createAudioPipeline(url, requiresCookies = false, youtubeMusicFallback 
     fileAccessRetries: config.downloadRetries,
     retrySleep: 'http:linear=1::5',
     socketTimeout: 15,
+    ...youtubeChallengeOptions(),
     ...youtubeMusicAccessOptions(youtubeMusicFallback),
     ...ytdlpOptions(usedCookies),
   }, { stdio: ['ignore', 'pipe', 'pipe'] });

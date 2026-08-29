@@ -20,7 +20,15 @@ while ($true) {
   # Use cmd for byte-preserving append redirection, but explicitly hide its
   # window so the watchdog never leaves a console on the desktop.
   $command = "`"$node`" `"$index`" 1>>`"$log`" 2>>`"$errorLog`""
-  $process = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d', '/s', '/c', $command -WindowStyle Hidden -Wait -PassThru
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = 'cmd.exe'
+  $startInfo.Arguments = "/d /s /c `"$command`""
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  [void]$process.Start()
+  $process.WaitForExit()
   $exitCode = $process.ExitCode
   $stopped = Get-Date -Format o
   if ($exitCode -eq 0) {
