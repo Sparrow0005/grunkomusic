@@ -561,6 +561,8 @@ function clearIdleTimer(state) {
 function destroyQueue(guildId) {
   const state = guildQueues.get(guildId);
   if (!state) return;
+  state.shuttingDown = true;
+  if (state.current) state.current.intentionalStop = true;
   clearIdleTimer(state);
   state.current?.cleanup();
   state.player.stop(true);
@@ -685,7 +687,7 @@ async function initializeQueue(message) {
       const current = state.current;
       const song = state.nowPlaying;
       const elapsedSeconds = current?.startedAt ? (Date.now() - current.startedAt) / 1000 : null;
-      const endedEarly = !current?.intentionalStop && song?.duration && elapsedSeconds !== null &&
+      const endedEarly = !state.shuttingDown && !current?.intentionalStop && song?.duration && elapsedSeconds !== null &&
         elapsedSeconds < song.duration - Math.max(15, song.duration * 0.05);
       if (endedEarly && (song.playbackAttempts || 0) < config.playbackRetries) {
         song.playbackAttempts = (song.playbackAttempts || 0) + 1;
