@@ -8,6 +8,8 @@ const {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  ActivityType,
+  Routes,
 } = require('discord.js');
 const {
   AudioPlayerStatus,
@@ -21,12 +23,15 @@ const {
 } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
 const ytdlp = require('youtube-dl-exec');
+const { getDetails: getSpotifyDetails, getPreview: getSpotifyPreview } = require('spotify-url-info')(fetch);
 const config = require('./config');
 
 const prefix = '-';
+// Each guild owns an independent connection, player, queue, and recovery state.
 const guildQueues = new Map();
 const guildQueueInitializations = new Map();
 let ytdlpUpdatePromise = null;
+let presenceTimer = null;
 
 function readLastYtdlpUpdateAttempt() {
   try {
@@ -127,9 +132,9 @@ async function warnAboutExpiredCookies(message) {
   await logAndReply(message, 'YouTube login cookies appear to be expired. I’ll still try public videos, but restricted videos need a refreshed `cookies.txt`.');
 }
 
-async function updateYtdlp(reason = 'scheduled maintenance', force = false) {
+async function updateYtdlp(reason = 'scheduled maintenance') {
   const now = Date.now();
-  if (!force && now - lastYtdlpUpdateAttempt < config.ytdlpUpdateCooldown) return false;
+  if (now - lastYtdlpUpdateAttempt < config.ytdlpUpdateCooldown) return false;
   if (ytdlpUpdatePromise) return ytdlpUpdatePromise;
   lastYtdlpUpdateAttempt = now;
   try {
@@ -138,7 +143,7 @@ async function updateYtdlp(reason = 'scheduled maintenance', force = false) {
     console.error('[RECOVERY] Could not persist yt-dlp maintenance state:', errorText(error));
   }
   console.log(`[RECOVERY] Checking yt-dlp for updates: ${reason}`);
-  ytdlpUpdatePromise = ytdlp.exec('--update')
+  ytdlpUpdatePromise = ytdlp.update()
     .then(() => {
       console.log('[RECOVERY] yt-dlp update check completed.');
       return true;
@@ -178,24 +183,37 @@ function readToken() {
   return fs.readFileSync(config.tokenFilePath, 'utf8').trim();
 }
 
+function themedContent(content) {
+  if (typeof content !== 'string' || /^[🎶📻📜🔎🎛️⏭️👋🔀🩺⚠️🛠️🎵]/u.test(content)) return content;
+  if (/retry|recover|searching|replacement|fallback|standard stream|ended early|hiccup/i.test(content)) {
+    return `🛠️ ${content}`;
+  }
+  if (/error|couldn(?:'t| not)|cannot|can't|need|no song|not available|unavailable|expired|missing|invalid|timed out|cancelled|queue is full|already have|provide |that's not|there is no/i.test(content)) {
+    return `⚠️ ${content}`;
+  }
+  return `🎵 ${content}`;
+}
+
 function logAndSend(channel, content) {
-  console.log(`[BOT → ${channel?.guild?.name ?? 'Unknown'}#${channel?.name ?? 'Unknown'}] ${content}`);
-  return channel.send(content).catch((error) => console.error('Could not send Discord message:', error));
+  const themed = themedContent(content);
+  console.log(`[BOT → ${channel?.guild?.name ?? 'Unknown'}#${channel?.name ?? 'Unknown'}] ${themed}`);
+  return channel.send(themed).catch((error) => console.error('Could not send Discord message:', error));
 }
 
 function logAndReply(message, content) {
-  console.log(`[BOT → ${message.guild?.name ?? 'Unknown'}#${message.channel?.name ?? 'Unknown'}] ${content}`);
-  return message.reply(content).catch((error) => console.error('Could not reply in Discord:', error));
+  const themed = themedContent(content);
+  console.log(`[BOT → ${message.guild?.name ?? 'Unknown'}#${message.channel?.name ?? 'Unknown'}] ${themed}`);
+  return message.reply(themed).catch((error) => console.error('Could not reply in Discord:', error));
 }
 
 async function sendQueue(message, songs) {
   const pages = [];
-  let page = 'Current Queue:\n';
+  let page = '📜 **Grunko Queue**\n';
   songs.forEach((song, index) => {
-    const line = `${index + 1}. ${song.title}\n`;
+    const line = `${index + 1}. ${song.title} -- (${formatDuration(song.duration)})\n`;
     if (page.length + line.length > 1900) {
       pages.push(page.trimEnd());
-      page = `Current Queue (continued):\n${line}`;
+      page = `📜 **Grunko Queue -- continued**\n${line}`;
     } else {
       page += line;
     }
@@ -212,11 +230,11 @@ function buildQueueEmbed(guildId, requestedPage = 0) {
   const firstIndex = page * 10;
   const pageSongs = songs.slice(firstIndex, firstIndex + 10);
   const description = pageSongs.length
-    ? pageSongs.map((song, index) => `**${firstIndex + index + 1}.** ${song.title}`).join('\n')
-    : 'The queue is currently empty.';
+    ? pageSongs.map((song, index) => `**${firstIndex + index + 1}.** ${song.title} -- \`${formatDuration(song.duration)}\``).join('\n')
+    : 'No songs are waiting in the wings.';
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle('Current Queue')
+    .setTitle('📜 Grunko Queue')
     .setDescription(description)
     .setFooter({ text: `Page ${page + 1} of ${pageCount} • ${songs.length} upcoming song${songs.length === 1 ? '' : 's'}` });
 
@@ -303,15 +321,372 @@ function normalizePlaylistUrl(input) {
   return `https://www.youtube.com/playlist?list=${playlistId}`;
 }
 
-function containsYouTubePlaylist(input) {
+function classifyYouTubePlaylistInput(input) {
   try {
-    const parsed = new URL(sanitizeUrlInput(input));
+    const sanitized = sanitizeUrlInput(input);
+    const parsed = new URL(sanitized);
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
-    return ['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(hostname) &&
-      Boolean(parsed.searchParams.get('list'));
+    if (!['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(hostname)) return 'none';
+    if (!parsed.searchParams.get('list')) return 'none';
+
+    const radioAtEnd = parsed.pathname === '/watch' && /[?&]start_radio=1(?:#.*)?$/i.test(sanitized);
+    if (radioAtEnd) return 'radio';
+    if (parsed.pathname === '/playlist') return 'playlist';
+
+    const videoId = parsed.searchParams.get('v');
+    if (parsed.pathname === '/watch' && /^[A-Za-z0-9_-]{11}$/.test(videoId || '')) return 'ambiguous';
+    return 'playlist';
   } catch {
-    return false;
+    return 'none';
   }
+}
+
+function formatTimestamp(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '?:??';
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.floor(seconds % 60);
+  return `${minutes}:${String(remainder).padStart(2, '0')}`;
+}
+
+function formatDuration(seconds) {
+  return Number.isFinite(seconds) && seconds > 0 ? formatTimestamp(seconds) : 'unknown length';
+}
+
+function playbackElapsedSeconds(state) {
+  const resourceElapsed = Number(state?.player?.state?.resource?.playbackDuration) / 1000;
+  if (Number.isFinite(resourceElapsed) && resourceElapsed >= 0) return resourceElapsed;
+  if (state?.current?.startedAt) return Math.max(0, (Date.now() - state.current.startedAt) / 1000);
+  return 0;
+}
+
+function playbackProgress(state) {
+  const elapsed = playbackElapsedSeconds(state);
+  const total = Number(state?.nowPlaying?.duration) || null;
+  const displayElapsed = total ? Math.min(elapsed, total) : elapsed;
+  return `${formatTimestamp(displayElapsed)}/${total ? formatTimestamp(total) : '?:??'}`;
+}
+
+function updateVoiceChannelStatus(state, force = false) {
+  if (!state?.voiceChannelId || !client.user) return;
+  const suffix = state.nowPlaying ? ` -- (${playbackProgress(state)})` : '';
+  const maxTitleLength = Math.max(1, 500 - '🎶 '.length - suffix.length);
+  const title = state.nowPlaying?.title || '';
+  const shortenedTitle = title.length > maxTitleLength
+    ? `${title.slice(0, Math.max(1, maxTitleLength - 1))}…`
+    : title;
+  const status = state.nowPlaying ? `🎶 ${shortenedTitle}${suffix}` : null;
+  const now = Date.now();
+  if (status === state.voiceStatusTarget) return;
+  if (status && !force && now - (state.voiceStatusLastAttempt || 0) < 30_000) return;
+  state.voiceStatusLastAttempt = now;
+  state.voiceStatusTarget = status;
+  // Serialize status writes so a delayed song update cannot overwrite a later clear.
+  state.voiceStatusPromise = (state.voiceStatusPromise || Promise.resolve())
+    .then(() => client.rest.put(Routes.channelVoiceStatus(state.voiceChannelId), { body: { status } }))
+    .then(() => {
+      state.voiceStatusLastText = status;
+      state.voiceStatusPermissionWarned = false;
+    })
+    .catch((error) => {
+      if (state.voiceStatusTarget === status) state.voiceStatusTarget = state.voiceStatusLastText;
+      if (!state.voiceStatusPermissionWarned) {
+        console.error('[STATUS] Could not update voice channel status. Ensure the bot has Set Voice Channel Status permission:', errorText(error));
+        state.voiceStatusPermissionWarned = true;
+      }
+    });
+}
+
+function updateBotPresence() {
+  if (!client.user) return;
+  // A bot has one global presence, so keep it private and show only an active-server count.
+  const activeStates = [...guildQueues.values()]
+    .filter((state) => state.nowPlaying)
+    .sort((a, b) => (b.current?.startedAt || 0) - (a.current?.startedAt || 0));
+  for (const state of activeStates) updateVoiceChannelStatus(state);
+  if (!activeStates.length) {
+    client.user.setActivity('requests | -help', { type: ActivityType.Listening });
+    return;
+  }
+  const serverLabel = activeStates.length === 1 ? 'server' : 'servers';
+  client.user.setActivity(`music in ${activeStates.length} ${serverLabel}`, { type: ActivityType.Playing });
+}
+
+function musicSearchScore(entry, index, query) {
+  const title = String(entry.title || '').toLowerCase();
+  const channel = String(entry.channel || entry.uploader || '').toLowerCase();
+  const terms = normalizeSearchText(query).split(' ').filter((term) => term.length > 1);
+  const matchingTerms = terms.filter((term) => title.includes(term) || channel.includes(term)).length;
+  let score = 100 - index * 4 + matchingTerms * 5;
+  if (/\s-\stopic$/.test(channel)) score += 18;
+  if (/official (?:audio|video)|lyrics?|audio|music video|soundtrack/.test(title)) score += 10;
+  if (Number(entry.duration) >= 60 && Number(entry.duration) <= 15 * 60) score += 4;
+  if (/shorts?|clip|trailer|reaction/.test(title)) score -= 8;
+  return score;
+}
+
+async function searchYouTube(query, resultLimit = 5) {
+  const info = await withRecovery(() => ytdlp(`ytsearch12:${query}`, {
+    dumpSingleJson: true,
+    flatPlaylist: true,
+    playlistEnd: 12,
+    noWarnings: true,
+    socketTimeout: 15,
+    ...youtubeChallengeOptions(),
+  }), { label: 'YouTube search', retries: config.metadataRetries, allowYtdlpUpdate: true });
+
+  return (info.entries || [])
+    .filter((entry) => entry?.id && /^[A-Za-z0-9_-]{11}$/.test(entry.id))
+    .map((entry, index) => ({
+      url: `https://www.youtube.com/watch?v=${entry.id}`,
+      title: entry.title || 'Unknown title',
+      sourceChannel: entry.channel || entry.uploader || 'Unknown channel',
+      duration: Number(entry.duration) || null,
+      score: musicSearchScore(entry, index, query),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Math.min(12, resultLimit)));
+}
+
+function extractSpotifyUrls(input) {
+  const matches = String(input || '').match(/https?:\/\/open\.spotify\.com\/[^\s<>]+/gi) || [];
+  const found = [];
+  for (const match of matches) {
+    try {
+      const parsed = new URL(match.replace(/[),.;]+$/, ''));
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const typeIndex = parts.findIndex((part) => ['track', 'playlist'].includes(part.toLowerCase()));
+      const type = typeIndex >= 0 ? parts[typeIndex].toLowerCase() : null;
+      const id = typeIndex >= 0 ? parts[typeIndex + 1] : null;
+      if (!type || !id || !/^[A-Za-z0-9]+$/.test(id)) continue;
+      const url = `https://open.spotify.com/${type}/${id}`;
+      if (!found.some((item) => item.url === url)) found.push({ type, url });
+    } catch {
+      // Ignore malformed URLs and let the command return a useful message.
+    }
+  }
+  return found;
+}
+
+function spotifyTrackToQueueSong(track, playlistTitle = null) {
+  const name = String(track.name || track.track || track.title || '').trim();
+  const artist = String(track.artist || '').trim();
+  if (!name) return null;
+  return {
+    title: artist ? `${artist} - ${name}` : name,
+    spotifyQuery: [artist, name].filter(Boolean).join(' '),
+    spotifyTrackName: name,
+    spotifyArtist: artist,
+    spotifyDuration: Number(track.duration || track.duration_ms) / 1000 || null,
+    sourcePlaylist: playlistTitle,
+    sourceChannel: artist || null,
+    playbackAttempts: 0,
+  };
+}
+
+function significantWords(value) {
+  const ignored = new Set(['a', 'an', 'and', 'the', 'feat', 'featuring', 'ft', 'official', 'audio', 'video', 'lyrics', 'lyric']);
+  return normalizeSearchText(value).split(' ').filter((word) => word.length > 1 && !ignored.has(word));
+}
+
+function wordCoverage(expected, actual) {
+  const words = significantWords(expected);
+  if (!words.length) return 0;
+  const actualWords = new Set(significantWords(actual));
+  return words.filter((word) => actualWords.has(word)).length / words.length;
+}
+
+function externalMatchDetails(song, candidate) {
+  const title = normalizeSearchText(song.spotifyTrackName || song.appleMusicTrackName);
+  const artist = normalizeSearchText(song.spotifyArtist || song.appleMusicArtist);
+  const expectedDuration = song.spotifyDuration || song.appleMusicDuration;
+  const candidateTitle = normalizeSearchText(candidate.title);
+  const candidateChannel = normalizeSearchText(candidate.sourceChannel);
+  const titleCoverage = wordCoverage(title, candidateTitle);
+  const artistCoverage = artist ? wordCoverage(artist, `${candidateTitle} ${candidateChannel}`) : 1;
+  const titleExact = Boolean(title && candidateTitle.includes(title));
+  const durationDifference = expectedDuration && candidate.duration
+    ? Math.abs(expectedDuration - candidate.duration)
+    : null;
+  const durationTolerance = expectedDuration ? Math.max(25, expectedDuration * 0.20) : null;
+  const durationAcceptable = durationDifference === null || durationDifference <= durationTolerance;
+  const titleAcceptable = titleExact || titleCoverage >= 0.75;
+  const artistAcceptable = !artist || artistCoverage >= 0.5 || (titleExact && title.split(' ').length >= 2);
+  const requestedVariant = /live|remix|cover|sped up|slowed/.test(title);
+  const unwantedVariant = !requestedVariant && /live|remix|cover|sped up|slowed/.test(candidateTitle);
+  let score = candidate.score || 0;
+  score += titleCoverage * 70;
+  score += artistCoverage * 45;
+  if (titleExact) score += 35;
+  if (/topic|official audio/.test(`${candidateChannel} ${candidateTitle}`)) score += 15;
+  if (durationDifference !== null) score += Math.max(0, 25 - durationDifference / 2);
+  if (unwantedVariant) score -= 25;
+  return {
+    accepted: titleAcceptable && artistAcceptable && durationAcceptable && !unwantedVariant,
+    score,
+    titleCoverage,
+    artistCoverage,
+    durationDifference,
+    reason: !titleAcceptable ? 'title mismatch'
+      : !artistAcceptable ? 'artist mismatch'
+        : !durationAcceptable ? 'duration mismatch'
+          : unwantedVariant ? 'unrequested version'
+            : 'accepted',
+  };
+}
+
+async function resolveExternalSong(song) {
+  const artist = song.spotifyArtist || song.appleMusicArtist;
+  const title = song.spotifyTrackName || song.appleMusicTrackName;
+  const queries = [
+    `${artist} ${title} official audio`,
+    `"${title}" "${artist}"`,
+    `${artist} ${title}`,
+  ].filter((query, index, all) => query.trim() && all.indexOf(query) === index);
+  const candidatesByUrl = new Map();
+  for (const query of queries) {
+    const results = await searchYouTube(query, 12);
+    for (const candidate of results) {
+      const existing = candidatesByUrl.get(candidate.url);
+      if (!existing || candidate.score > existing.score) candidatesByUrl.set(candidate.url, candidate);
+    }
+  }
+  const candidates = [...candidatesByUrl.values()]
+    .map((candidate) => ({ candidate, match: externalMatchDetails(song, candidate) }))
+    .sort((a, b) => b.match.score - a.match.score);
+  const sourceName = song.spotifyQuery ? 'SPOTIFY' : 'APPLE MUSIC';
+  const rejected = candidates.filter(({ match }) => !match.accepted);
+  if (rejected.length) {
+    console.log(`[${sourceName}] Rejected ${rejected.length} candidate(s) for ${song.title}: ` +
+      rejected.slice(0, 5).map(({ candidate, match }) => `${candidate.title} (${match.reason})`).join('; '));
+  }
+  let lastError;
+  for (const { candidate, match } of candidates) {
+    if (!match.accepted) continue;
+    try {
+      const resolved = await resolveSong(candidate.url);
+      return {
+        ...song,
+        ...resolved,
+        sourcePlaylist: song.sourcePlaylist,
+        sourceChannel: artist || resolved.sourceChannel,
+        metadataValidated: true,
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error(`No playable YouTube match found for ${song.title}`);
+}
+
+function extractAppleMusicUrls(input) {
+  const matches = String(input || '').match(/https?:\/\/(?:music\.)?apple\.com\/[^\s<>]+/gi) || [];
+  const found = [];
+  for (const match of matches) {
+    try {
+      const parsed = new URL(match.replace(/[),.;]+$/, ''));
+      if (parsed.hostname.toLowerCase() !== 'music.apple.com') continue;
+      const path = parsed.pathname.toLowerCase();
+      let type = null;
+      if (path.includes('/playlist/')) type = 'playlist';
+      else if (path.includes('/song/') || (path.includes('/album/') && parsed.searchParams.get('i'))) type = 'track';
+      if (!type) continue;
+      parsed.hash = '';
+      const url = parsed.toString();
+      if (!found.some((item) => item.url === url)) found.push({ type, url });
+    } catch {
+      // Ignore malformed URLs and let the command return a useful message.
+    }
+  }
+  return found;
+}
+
+function isoDurationToSeconds(value) {
+  const match = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i.exec(String(value || ''));
+  if (!match) return null;
+  return Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0);
+}
+
+function scriptJson(html, marker) {
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex < 0) throw new Error(`Apple Music page is missing ${marker}`);
+  const start = html.indexOf('>', markerIndex) + 1;
+  const end = html.indexOf('</script>', start);
+  if (!start || end < 0) throw new Error(`Apple Music page has invalid ${marker}`);
+  return JSON.parse(html.slice(start, end));
+}
+
+async function fetchAppleMusicPage(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'music.apple.com') {
+    throw new Error('Unsupported Apple Music URL');
+  }
+  const response = await fetch(parsed, {
+    headers: { 'user-agent': 'Mozilla/5.0 GrunkoMusicBot/2.0' },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!response.ok) throw new Error(`Apple Music returned HTTP ${response.status}`);
+  const html = await response.text();
+  if (html.length > 10_000_000) throw new Error('Apple Music response was unexpectedly large');
+  return html;
+}
+
+function appleMusicTrackToQueueSong(track, playlistTitle = null) {
+  const name = String(track.name || track.title || '').trim();
+  const artist = String(track.artist || track.artistName || '').trim();
+  if (!name) return null;
+  return {
+    title: artist ? `${artist} - ${name}` : name,
+    appleMusicQuery: [artist, name].filter(Boolean).join(' '),
+    appleMusicTrackName: name,
+    appleMusicArtist: artist,
+    appleMusicDuration: Number(track.duration) || null,
+    sourcePlaylist: playlistTitle,
+    sourceChannel: artist || null,
+    playbackAttempts: 0,
+  };
+}
+
+async function readAppleMusic(url, type) {
+  const html = await fetchAppleMusicPage(url);
+  if (type === 'track') {
+    const structured = scriptJson(html, 'application/ld+json');
+    const recording = structured.audio?.['@type'] === 'MusicRecording' ? structured.audio : structured;
+    const artists = recording.byArtist || recording.inAlbum?.byArtist || [];
+    return {
+      type,
+      title: recording.name || structured.name,
+      artist: artists.map((artist) => artist.name).filter(Boolean).join(', '),
+      duration: isoDurationToSeconds(recording.duration || structured.timeRequired),
+    };
+  }
+
+  const serverData = scriptJson(html, 'serialized-server-data');
+  const tracks = [];
+  const seen = new Set();
+  let playlistTitle = null;
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (!playlistTitle && value.contentDescriptor?.kind === 'playlist' && value.title) {
+      playlistTitle = String(value.title).trim();
+    }
+    if (value.contentDescriptor?.kind === 'song' && value.title && value.artistName) {
+      const id = value.contentDescriptor.identifiers?.storeAdamID || value.contentDescriptor.url || `${value.artistName}:${value.title}`;
+      if (!seen.has(id)) {
+        seen.add(id);
+        tracks.push({ title: value.title, artist: value.artistName, duration: Number(value.duration) / 1000 || null });
+      }
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(serverData);
+  if (!playlistTitle) {
+    try {
+      playlistTitle = scriptJson(html, 'application/ld+json').name;
+    } catch {
+      // Some valid Apple Music playlist pages omit JSON-LD.
+    }
+  }
+  return { type, title: playlistTitle || 'Apple Music playlist', tracks };
 }
 
 async function resolvePlaylist(url, maxEntries) {
@@ -338,7 +713,7 @@ async function resolvePlaylist(url, maxEntries) {
       info = await lookup(true);
       requiresCookies = true;
     } catch (cookieError) {
-      if (isCookieRejectionError(cookieError)) markCookiesUnhealthy(cookieError);
+      if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
       throw cookieError;
     }
   }
@@ -350,6 +725,7 @@ async function resolvePlaylist(url, maxEntries) {
     .map((entry) => ({
       url: `https://www.youtube.com/watch?v=${entry.id}`,
       title: entry.title || 'Unknown title',
+      duration: Number(entry.duration) || null,
       playbackAttempts: 0,
       requiresCookies,
       sourcePlaylist: info.title || null,
@@ -399,7 +775,7 @@ async function resolveSong(url) {
         requiresCookies = true;
         youtubeMusicFallback = triedYouTubeMusic;
       } catch (cookieError) {
-        if (isCookieRejectionError(cookieError)) markCookiesUnhealthy(cookieError);
+        if (isCookieError(cookieError)) markCookiesUnhealthy(cookieError);
         throw cookieError;
       }
     }
@@ -567,7 +943,10 @@ function destroyQueue(guildId) {
   state.current?.cleanup();
   state.player.stop(true);
   state.connection.destroy();
+  state.nowPlaying = null;
+  updateVoiceChannelStatus(state, true);
   guildQueues.delete(guildId);
+  updateBotPresence();
 }
 
 function scheduleDisconnect(guildId) {
@@ -587,6 +966,23 @@ async function playNext(guildId) {
   state.nowPlaying = song;
 
   try {
+    if ((song.spotifyQuery || song.appleMusicQuery) && !song.metadataValidated) {
+      try {
+        const externalTitle = song.title;
+        const sourceName = song.spotifyQuery ? 'SPOTIFY' : 'APPLE MUSIC';
+        song = await resolveExternalSong(song);
+        state.nowPlaying = song;
+        console.log(`[${sourceName}] Resolved ${externalTitle} to ${song.title}.`);
+      } catch (error) {
+        const sourceName = song.spotifyQuery ? 'Spotify' : 'Apple Music';
+        console.error(`[${sourceName.toUpperCase()}] Could not resolve ${song.title}:`, errorText(error));
+        await logAndSend(state.textChannel, `I couldn't find a playable match for ${sourceName} track **${song.title}**, so I'm skipping it.`);
+        state.playing = false;
+        state.nowPlaying = null;
+        setImmediate(() => playNext(guildId));
+        return;
+      }
+    }
     if (song.sourcePlaylist && !song.metadataValidated) {
       try {
         const resolved = await resolveSong(song.url);
@@ -623,7 +1019,9 @@ async function playNext(guildId) {
       inputType: StreamType.Raw,
       metadata: { generation },
     }));
-    await logAndSend(state.textChannel, `🎶 Now playing: **${song.title}**`);
+    updateVoiceChannelStatus(state, true);
+    updateBotPresence();
+    await logAndSend(state.textChannel, `🎶 **Grunko is playing:** ${song.title} -- \`${playbackProgress(state)}\``);
   } catch (error) {
     console.error('Could not start playback:', error);
     await logAndSend(state.textChannel, `There was an error trying to play **${song.title}**.`);
@@ -639,6 +1037,8 @@ function finishCurrent(guildId, generation = null) {
   state.current = null;
   state.playing = false;
   state.nowPlaying = null;
+  updateVoiceChannelStatus(state, true);
+  updateBotPresence();
   setImmediate(() => playNext(guildId));
 }
 
@@ -675,6 +1075,8 @@ async function initializeQueue(message) {
   state = {
     connection, player, songs: [], playing: false, nowPlaying: null,
     current: null, textChannel: message.channel, idleTimer: null,
+    voiceChannelId: voiceChannel.id, voiceStatusLastText: null, voiceStatusTarget: null,
+    voiceStatusLastAttempt: 0, voiceStatusPromise: Promise.resolve(),
   };
   player.on('stateChange', (oldState, newState) => {
     if (newState.status === AudioPlayerStatus.Playing) clearIdleTimer(state);
@@ -787,6 +1189,258 @@ async function getOrCreateQueue(message) {
   return initialization;
 }
 
+const activePrompts = new Set();
+
+function waitForUserChoice(message, validChoices, timeoutMs = 45_000) {
+  const allowed = new Set(validChoices.map((choice) => String(choice).toLowerCase()));
+  return new Promise((resolve) => {
+    let settled = false;
+    const collector = message.channel.createMessageCollector({
+      filter: (reply) => reply.author.id === message.author.id && !reply.author.bot,
+      time: timeoutMs,
+    });
+    collector.on('collect', (reply) => {
+      const choice = reply.content.trim().toLowerCase();
+      if (!allowed.has(choice)) {
+        reply.reply(`Choose ${validChoices.join(', ')}.`).catch(() => {});
+        return;
+      }
+      settled = true;
+      collector.stop('selected');
+      resolve(choice);
+    });
+    collector.on('end', () => {
+      if (!settled) resolve(null);
+    });
+  });
+}
+
+async function enqueueSong(message, song) {
+  let state;
+  try {
+    state = await getOrCreateQueue(message);
+  } catch (error) {
+    console.error('Error connecting to voice:', error);
+    return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
+  }
+
+  state.textChannel = message.channel;
+  if (state.songs.length >= config.maxQueueSize) {
+    return logAndReply(message, `The queue is full (${config.maxQueueSize} songs). Try again later.`);
+  }
+  state.songs.push({ ...song, playbackAttempts: 0 });
+  await logAndReply(message, `📻 **Queued:** ${song.title} -- \`${formatDuration(song.duration)}\``);
+  playNext(message.guild.id);
+}
+
+async function enqueueSongBatch(message, songs, title, label = 'Playlist') {
+  let state;
+  try {
+    state = await getOrCreateQueue(message);
+  } catch (error) {
+    console.error(`Error connecting to voice for ${label}:`, error);
+    return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
+  }
+
+  const availableSlots = Math.max(0, config.maxQueueSize - state.songs.length);
+  const songsToAdd = songs.slice(0, availableSlots);
+  if (!songsToAdd.length) {
+    const reason = availableSlots === 0
+      ? `The queue is full (${config.maxQueueSize} songs).`
+      : `I could not find any playable songs in that ${label.toLowerCase()}.`;
+    return logAndReply(message, reason);
+  }
+
+  state.textChannel = message.channel;
+  state.songs.push(...songsToAdd);
+  const omitted = songs.length - songsToAdd.length;
+  const suffix = omitted > 0 ? ` The queue limit left out ${omitted} song${omitted === 1 ? '' : 's'}.` : '';
+  await logAndReply(message, `📻 **${label} queued:** ${songsToAdd.length} songs from **${title}**.${suffix}`);
+  playNext(message.guild.id);
+}
+
+async function handleSongRequest(message, url) {
+  await warnAboutExpiredCookies(message);
+  let song;
+  try {
+    song = await resolveSong(url);
+    await warnAboutExpiredCookies(message);
+  } catch (error) {
+    console.error('Error processing video:', error);
+    if (isCookieError(error) && cookieStatus() !== 'active') {
+      return logAndReply(message, `This video needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+    }
+    return logAndReply(message, 'There was an error trying to play the video.');
+  }
+  return enqueueSong(message, song);
+}
+
+async function handlePlaylistRequest(message, url) {
+  await warnAboutExpiredCookies(message);
+  let playlist;
+  try {
+    playlist = await resolvePlaylist(url, config.maxQueueSize);
+    await warnAboutExpiredCookies(message);
+  } catch (error) {
+    console.error('Error processing playlist:', error);
+    if (isCookieError(error) && cookieStatus() !== 'active') {
+      return logAndReply(message, `This playlist needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+    }
+    return logAndReply(message, 'There was an error trying to queue the playlist.');
+  }
+
+  return enqueueSongBatch(message, playlist.songs, playlist.title);
+}
+
+async function handleSearchRequest(message, query) {
+  const promptKey = `${message.guild.id}:${message.author.id}`;
+  if (activePrompts.has(promptKey)) {
+    return logAndReply(message, 'You already have a selection waiting. Reply with a number or `x` first.');
+  }
+  activePrompts.add(promptKey);
+  try {
+    let results;
+    try {
+      results = await searchYouTube(query);
+    } catch (error) {
+      console.error('Error searching YouTube:', error);
+      return logAndReply(message, 'There was an error searching YouTube.');
+    }
+    if (!results.length) return logAndReply(message, 'I could not find any results for that search.');
+
+    const choices = results.map((result, index) =>
+      `**${index + 1}. ${result.title}** -- ${result.sourceChannel} -- ${formatDuration(result.duration)}`,
+    ).join('\n');
+    await logAndReply(message, `🔎 **Choose a tune:** reply with **1-5**, or reply **x** to cancel.\n${choices}`);
+    const choice = await waitForUserChoice(message, ['1', '2', '3', '4', '5', 'x']);
+    if (!choice) return logAndReply(message, 'Search timed out and was cancelled.');
+    if (choice === 'x') return logAndReply(message, 'Search cancelled.');
+    const selected = results[Number(choice) - 1];
+    if (!selected) return logAndReply(message, 'That result is not available.');
+    return handleSongRequest(message, selected.url);
+  } finally {
+    activePrompts.delete(promptKey);
+  }
+}
+
+async function handleSpotifyRequest(message, input) {
+  const urls = extractSpotifyUrls(input);
+  const trackUrl = urls.find((item) => item.type === 'track');
+  const playlistUrl = urls.find((item) => item.type === 'playlist');
+  if (!trackUrl && !playlistUrl) {
+    return logAndReply(message, 'Provide a Spotify track or playlist URL after `-spotify`.');
+  }
+
+  let selected = trackUrl || playlistUrl;
+  if (trackUrl && playlistUrl) {
+    const promptKey = `${message.guild.id}:${message.author.id}`;
+    if (activePrompts.has(promptKey)) {
+      return logAndReply(message, 'You already have a selection waiting. Reply to it first.');
+    }
+    activePrompts.add(promptKey);
+    let choice;
+    try {
+      await logAndReply(message,
+        '🎛️ **Spotify choice:** reply **s** for the song, **p** for the playlist, or **x** to cancel.');
+      choice = await waitForUserChoice(message, ['s', 'p', 'x']);
+    } finally {
+      activePrompts.delete(promptKey);
+    }
+    if (!choice) return logAndReply(message, 'Spotify choice timed out and was cancelled.');
+    if (choice === 'x') return logAndReply(message, 'Spotify request cancelled.');
+    selected = choice === 's' ? trackUrl : playlistUrl;
+  }
+
+  if (selected.type === 'track') {
+    let preview;
+    try {
+      preview = await withRecovery(() => getSpotifyPreview(selected.url), {
+        label: 'Spotify track lookup', retries: config.metadataRetries,
+      });
+    } catch (error) {
+      console.error('Error processing Spotify track:', error);
+      return logAndReply(message, 'There was an error reading that Spotify track.');
+    }
+    const song = spotifyTrackToQueueSong({
+      name: preview.track || preview.title,
+      artist: preview.artist,
+      duration: preview.duration,
+    });
+    if (!song) return logAndReply(message, 'I could not read the title from that Spotify track.');
+    return enqueueSong(message, song);
+  }
+
+  let details;
+  try {
+    details = await withRecovery(() => getSpotifyDetails(selected.url), {
+      label: 'Spotify playlist lookup', retries: config.metadataRetries,
+    });
+  } catch (error) {
+    console.error('Error processing Spotify playlist:', error);
+    return logAndReply(message, 'There was an error reading that Spotify playlist.');
+  }
+
+  const playlistTitle = details.preview?.title || 'Spotify playlist';
+  const spotifySongs = (details.tracks || [])
+    .map((track) => spotifyTrackToQueueSong(track, playlistTitle))
+    .filter(Boolean)
+    .slice(0, config.maxQueueSize);
+  if (!spotifySongs.length) return logAndReply(message, 'I could not find any tracks in that Spotify playlist.');
+
+  return enqueueSongBatch(message, spotifySongs, playlistTitle, 'Spotify playlist');
+}
+
+async function handleAppleMusicRequest(message, input) {
+  const urls = extractAppleMusicUrls(input);
+  const trackUrl = urls.find((item) => item.type === 'track');
+  const playlistUrl = urls.find((item) => item.type === 'playlist');
+  if (!trackUrl && !playlistUrl) {
+    return logAndReply(message, 'Provide an Apple Music song or playlist URL after `-applemusic`.');
+  }
+
+  let selected = trackUrl || playlistUrl;
+  if (trackUrl && playlistUrl) {
+    const promptKey = `${message.guild.id}:${message.author.id}`;
+    if (activePrompts.has(promptKey)) return logAndReply(message, 'You already have a selection waiting. Reply to it first.');
+    activePrompts.add(promptKey);
+    let choice;
+    try {
+      await logAndReply(message,
+        '🎛️ **Apple Music choice:** reply **s** for the song, **p** for the playlist, or **x** to cancel.');
+      choice = await waitForUserChoice(message, ['s', 'p', 'x']);
+    } finally {
+      activePrompts.delete(promptKey);
+    }
+    if (!choice) return logAndReply(message, 'Apple Music choice timed out and was cancelled.');
+    if (choice === 'x') return logAndReply(message, 'Apple Music request cancelled.');
+    selected = choice === 's' ? trackUrl : playlistUrl;
+  }
+
+  let details;
+  try {
+    details = await withRecovery(() => readAppleMusic(selected.url, selected.type), {
+      label: 'Apple Music lookup', retries: config.metadataRetries,
+    });
+  } catch (error) {
+    console.error('Error processing Apple Music link:', error);
+    return logAndReply(message, `There was an error reading that Apple Music ${selected.type === 'track' ? 'song' : 'playlist'}.`);
+  }
+
+  if (selected.type === 'track') {
+    const song = appleMusicTrackToQueueSong(details);
+    if (!song) return logAndReply(message, 'I could not read the title from that Apple Music song.');
+    return enqueueSong(message, song);
+  }
+
+  const appleSongs = details.tracks
+    .map((track) => appleMusicTrackToQueueSong(track, details.title))
+    .filter(Boolean)
+    .slice(0, config.maxQueueSize);
+  if (!appleSongs.length) return logAndReply(message, 'I could not find any tracks in that Apple Music playlist.');
+
+  return enqueueSongBatch(message, appleSongs, details.title, 'Apple Music playlist');
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -805,78 +1459,70 @@ client.on('messageCreate', async (message) => {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
     const url = args[0];
     if (!url) return logAndReply(message, 'You need to provide a YouTube URL to play a song!');
-    if (containsYouTubePlaylist(url)) {
+    let parsedInput;
+    try {
+      parsedInput = new URL(sanitizeUrlInput(url));
+      if (!['http:', 'https:'].includes(parsedInput.protocol)) throw new Error('Unsupported protocol');
+    } catch {
+      return logAndReply(message, "That's not a link. If you're trying to search with plain text, please use `-search <words>`.");
+    }
+    if (parsedInput.hostname.toLowerCase() === 'open.spotify.com') {
+      return logAndReply(message, 'That is a Spotify link. Use `-spotify <URL>` to queue Spotify songs or playlists.');
+    }
+    if (parsedInput.hostname.toLowerCase() === 'music.apple.com') {
+      return logAndReply(message, 'That is an Apple Music link. Use `-applemusic <URL>` to queue Apple Music songs or playlists.');
+    }
+    const playlistType = classifyYouTubePlaylistInput(url);
+    if (playlistType === 'playlist') {
       return logAndReply(message, 'That link contains a playlist. Use `-pl <URL>` or `-playlist <URL>` to queue it.');
     }
-    await warnAboutExpiredCookies(message);
-    let song;
-    try {
-      song = await resolveSong(url);
-      await warnAboutExpiredCookies(message);
-    } catch (error) {
-      console.error('Error processing video:', error);
-      if (isCookieError(error) && cookieStatus() !== 'active') {
-        return logAndReply(message, `This video needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+    if (playlistType === 'ambiguous') {
+      const promptKey = `${message.guild.id}:${message.author.id}`;
+      if (activePrompts.has(promptKey)) {
+        return logAndReply(message, 'You already have a selection waiting. Reply to it first.');
       }
-      return logAndReply(message, 'There was an error trying to play the video.');
+      activePrompts.add(promptKey);
+      let choice;
+      try {
+        await logAndReply(message,
+          '🎛️ **Pick what Grunko should play:** reply **p** for the whole playlist, **s** for only this song, or **x** to cancel.');
+        choice = await waitForUserChoice(message, ['p', 's', 'x']);
+      } finally {
+        activePrompts.delete(promptKey);
+      }
+      if (!choice) return logAndReply(message, 'Playlist choice timed out and was cancelled.');
+      if (choice === 'x') return logAndReply(message, 'Request cancelled.');
+      if (choice === 'p') return handlePlaylistRequest(message, url);
     }
-
-    let state;
-    try {
-      state = await getOrCreateQueue(message);
-    } catch (error) {
-      console.error('Error connecting to voice:', error);
-      return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
-    }
-
-    state.textChannel = message.channel;
-    if (state.songs.length >= config.maxQueueSize) {
-      return logAndReply(message, `The queue is full (${config.maxQueueSize} songs). Try again later.`);
-    }
-    state.songs.push({ ...song, playbackAttempts: 0 });
-    await logAndReply(message, `Added to the queue: ${song.title}`);
-    playNext(message.guild.id);
+    return handleSongRequest(message, url);
   }
 
   if (command === 'playlist' || command === 'pl') {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue a playlist!');
     const url = args[0];
     if (!url) return logAndReply(message, 'You need to provide a YouTube playlist URL!');
-    await warnAboutExpiredCookies(message);
+    return handlePlaylistRequest(message, url);
+  }
 
-    let playlist;
-    try {
-      playlist = await resolvePlaylist(url, config.maxQueueSize);
-      await warnAboutExpiredCookies(message);
-    } catch (error) {
-      console.error('Error processing playlist:', error);
-      if (isCookieError(error) && cookieStatus() !== 'active') {
-        return logAndReply(message, `This playlist needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
-      }
-      return logAndReply(message, 'There was an error trying to queue the playlist.');
-    }
+  if (command === 'search') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to search for music!');
+    const query = args.join(' ').trim();
+    if (!query) return logAndReply(message, 'You need to provide something to search for!');
+    return handleSearchRequest(message, query);
+  }
 
-    let state;
-    try {
-      state = await getOrCreateQueue(message);
-    } catch (error) {
-      console.error('Error connecting to voice for playlist:', error);
-      return logAndReply(message, 'I joined, but Discord could not establish the audio connection. Please try again.');
-    }
+  if (command === 'spotify') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue Spotify music!');
+    const input = args.join(' ').trim();
+    if (!input) return logAndReply(message, 'Provide a Spotify track or playlist URL after `-spotify`.');
+    return handleSpotifyRequest(message, input);
+  }
 
-    const availableSlots = Math.max(0, config.maxQueueSize - state.songs.length);
-    const songsToAdd = playlist.songs.slice(0, availableSlots);
-    if (!songsToAdd.length) {
-      const reason = availableSlots === 0 ? `The queue is full (${config.maxQueueSize} songs).` : 'I could not find any playable videos in that playlist.';
-      return logAndReply(message, reason);
-    }
-
-    state.textChannel = message.channel;
-    state.songs.push(...songsToAdd);
-    const omitted = playlist.songs.length - songsToAdd.length;
-    const suffix = omitted > 0 ? ` The queue limit left out ${omitted} song${omitted === 1 ? '' : 's'}.` : '';
-    await logAndReply(message, `Added **${songsToAdd.length}** songs from **${playlist.title}**.${suffix}`);
-    playNext(message.guild.id);
+  if (command === 'applemusic' || command === 'apple') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue Apple Music!');
+    const input = args.join(' ').trim();
+    if (!input) return logAndReply(message, 'Provide an Apple Music song or playlist URL after `-applemusic`.');
+    return handleAppleMusicRequest(message, input);
   }
 
   if (command === 'skip' || command === 's') {
@@ -887,28 +1533,28 @@ client.on('messageCreate', async (message) => {
     state.current?.cleanup();
     state.player.stop(true);
     finishCurrent(message.guild.id, generation);
-    return logAndReply(message, 'Skipping to the next song.');
+    return logAndReply(message, '⏭️ **Skipping:** bringing up the next song.');
   }
 
   if (command === 'leave' || command === 'l') {
     if (!guildQueues.has(message.guild.id)) return logAndReply(message, 'I am not in a voice channel.');
     destroyQueue(message.guild.id);
-    return logAndReply(message, 'I have left the voice channel and cleared the queue!');
+    return logAndReply(message, '👋 **Grunko has left the stage:** voice disconnected and queue cleared.');
   }
 
   if (command === 'shuffle') {
     const state = guildQueues.get(message.guild.id);
-    if (!state?.songs.length) return logAndReply(message, 'The queue is empty, nothing to shuffle.');
+    if (!state?.songs.length) return logAndReply(message, '📜 **Grunko Queue:** nothing is waiting to be shuffled.');
     for (let i = state.songs.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [state.songs[i], state.songs[j]] = [state.songs[j], state.songs[i]];
     }
-    return logAndReply(message, 'Queue shuffled!');
+    return logAndReply(message, '🔀 **Grunko Queue shuffled!**');
   }
 
   if (command === 'queue' || command === 'q') {
     const state = guildQueues.get(message.guild.id);
-    if (!state?.songs.length) return logAndReply(message, 'The queue is currently empty.');
+    if (!state?.songs.length) return logAndReply(message, '📜 **Grunko Queue:** no songs are waiting in the wings.');
     if (state.songs.length > 10) {
       console.log(`[BOT → ${message.guild.name}#${message.channel.name}] Displaying paginated queue.`);
       return message.reply(buildQueueEmbed(message.guild.id, 0))
@@ -918,9 +1564,10 @@ client.on('messageCreate', async (message) => {
   }
 
   if (command === 'playing' || command === 'np') {
-    const song = guildQueues.get(message.guild.id)?.nowPlaying;
-    if (!song) return logAndReply(message, 'No song is currently playing.');
-    return logAndReply(message, `🎶 Now playing: **${song.title}**`);
+    const state = guildQueues.get(message.guild.id);
+    const song = state?.nowPlaying;
+    if (!song) return logAndReply(message, '🎶 **Grunko is quiet:** no song is currently playing.');
+    return logAndReply(message, `🎶 **Grunko is playing:** ${song.title} -- \`${playbackProgress(state)}\``);
   }
 
   if (command === 'health') {
@@ -930,19 +1577,22 @@ client.on('messageCreate', async (message) => {
       : status === 'expired'
         ? 'YouTube cookies appear expired; public-video fallback is active.'
         : 'YouTube cookies are missing; public videos may still work.';
-    return logAndReply(message, `Music systems are online. ${cookieMessage}`);
+    return logAndReply(message, `🩺 **Grunko health:** music systems are online. ${cookieMessage}`);
   }
 
   if (command === 'help' || command === 'h') {
     return logAndReply(message,
-      '**Commands List:**\n' +
+      '🎛️ **Grunko Music Commands**\n' +
       '`-play <URL>` or `-p <URL>` - Plays the requested song\n' +
+      '`-search <words>` - Searches YouTube and offers five choices\n' +
+      '`-spotify <URL>` - Queues a Spotify song or playlist\n' +
+      '`-applemusic <URL>` or `-apple <URL>` - Queues an Apple Music song or playlist\n' +
       '`-playlist <URL>` or `-pl <URL>` - Adds a YouTube playlist\n' +
       '`-skip` or `-s` - Skips the current song\n' +
       '`-leave` or `-l` - Disconnects bot from the voice channel\n' +
       '`-shuffle` - Shuffles the current queue\n' +
       '`-queue` or `-q` - Lists the current queue\n' +
-      '`-playing` or `-np` - Displays the current song title\n' +
+      '`-playing` or `-np` - Displays the current song and playback timestamp\n' +
       '`-health` - Displays playback and YouTube cookie health\n' +
       '`-help` or `-h` - Displays this help message');
   }
@@ -952,7 +1602,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton() || !interaction.customId.startsWith('queue:')) return;
   const match = /^queue:(\d+):(-?\d+)$/.exec(interaction.customId);
   if (!match || interaction.guildId !== match[1]) {
-    return interaction.reply({ content: 'That queue control is no longer valid.', ephemeral: true });
+    return interaction.reply({ content: '📜 That Grunko Queue control is no longer valid.', ephemeral: true });
   }
   const page = Number.parseInt(match[2], 10);
   try {
@@ -960,19 +1610,23 @@ client.on('interactionCreate', async (interaction) => {
   } catch (error) {
     console.error('Could not update paginated queue:', error);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'I could not update that queue page.', ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: '⚠️ Grunko could not update that queue page.', ephemeral: true }).catch(() => {});
     }
   }
 });
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
+  updateBotPresence();
+  presenceTimer = setInterval(updateBotPresence, 15_000);
+  presenceTimer.unref();
   updateYtdlp('startup maintenance');
   setInterval(() => updateYtdlp('scheduled daily maintenance'), config.ytdlpUpdateInterval).unref();
 });
 client.on('error', (error) => console.error('Discord client error:', error));
 
 function shutdown(code = 0) {
+  if (presenceTimer) clearInterval(presenceTimer);
   guildQueues.forEach((_, id) => destroyQueue(id));
   client.destroy();
   process.exit(code);
