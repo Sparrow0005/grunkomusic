@@ -6,6 +6,8 @@ const scriptDirectory = __dirname;
 
 // Define paths for the bot's configuration files
 module.exports = {
+  // Stable Discord application owner ID for private maintenance alerts and mentions.
+  ownerUserId: '343142799111094272',
   tokenFilePath: path.join(scriptDirectory, 'token.txt'),
   cookiesFilePath: path.join(scriptDirectory, 'cookies.txt'),
   maintenanceStatePath: path.join(scriptDirectory, 'maintenance-state.json'),
@@ -19,5 +21,6 @@ module.exports = {
   ytdlpUpdateInterval: 24 * 60 * 60 * 1000,
   ytdlpUpdateCooldown: 6 * 60 * 60 * 1000,
   maxQueueSize: 100,
+  maxUploadSize: 25 * 1024 * 1024,
   cookieWarningCooldown: 60 * 60 * 1000,
 };

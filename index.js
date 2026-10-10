@@ -32,6 +32,10 @@ const guildQueues = new Map();
 const guildQueueInitializations = new Map();
 let ytdlpUpdatePromise = null;
 let presenceTimer = null;
+const playableAttachmentExtensions = new Set([
+  '.aac', '.flac', '.m4a', '.mkv', '.mov', '.mp3', '.mp4', '.ogg', '.opus', '.wav', '.webm', '.wma',
+]);
+const discordAttachmentHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
 
 function readLastYtdlpUpdateAttempt() {
   try {
@@ -125,11 +129,18 @@ function markCookiesUnhealthy(error) {
 
 async function warnAboutExpiredCookies(message) {
   if (cookieStatus() !== 'expired') return;
-  if (cookieHealth.lastWarningAt &&
-      Date.now() - cookieHealth.lastWarningAt < config.cookieWarningCooldown) return;
-  cookieHealth.lastWarningAt = Date.now();
+  const ownerRequest = message.author.id === config.ownerUserId;
+  const warningKey = ownerRequest ? 'lastOwnerWarningAt' : 'lastDiscoveryWarningAt';
+  if (cookieHealth[warningKey] &&
+      Date.now() - cookieHealth[warningKey] < config.cookieWarningCooldown) return;
+  cookieHealth[warningKey] = Date.now();
   writeCookieHealth();
-  await logAndReply(message, 'YouTube login cookies appear to be expired. I’ll still try public videos, but restricted videos need a refreshed `cookies.txt`.');
+  if (ownerRequest) {
+    await logAndReply(message, 'YouTube login cookies appear to be expired. I’ll still try public videos, but restricted videos need a refreshed `cookies.txt`.');
+    return;
+  }
+  await logAndSend(message.channel,
+    `<@${config.ownerUserId}>, Grunko discovered that the YouTube login cookies are expired. Please refresh \`cookies.txt\` when you can.`);
 }
 
 async function updateYtdlp(reason = 'scheduled maintenance') {
@@ -366,8 +377,8 @@ function playbackProgress(state) {
   return `${formatTimestamp(displayElapsed)}/${total ? formatTimestamp(total) : '?:??'}`;
 }
 
-function updateVoiceChannelStatus(state, force = false) {
-  if (!state?.voiceChannelId || !client.user) return;
+function updateVoiceChannelStatus(state, force = false, alwaysWrite = false) {
+  if (!state?.voiceChannelId || !client.user) return Promise.resolve();
   const suffix = state.nowPlaying ? ` -- (${playbackProgress(state)})` : '';
   const maxTitleLength = Math.max(1, 500 - '🎶 '.length - suffix.length);
   const title = state.nowPlaying?.title || '';
@@ -376,8 +387,10 @@ function updateVoiceChannelStatus(state, force = false) {
     : title;
   const status = state.nowPlaying ? `🎶 ${shortenedTitle}${suffix}` : null;
   const now = Date.now();
-  if (status === state.voiceStatusTarget) return;
-  if (status && !force && now - (state.voiceStatusLastAttempt || 0) < 30_000) return;
+  if (!alwaysWrite && status === state.voiceStatusTarget) return state.voiceStatusPromise || Promise.resolve();
+  if (status && !force && now - (state.voiceStatusLastAttempt || 0) < 30_000) {
+    return state.voiceStatusPromise || Promise.resolve();
+  }
   state.voiceStatusLastAttempt = now;
   state.voiceStatusTarget = status;
   // Serialize status writes so a delayed song update cannot overwrite a later clear.
@@ -394,6 +407,7 @@ function updateVoiceChannelStatus(state, force = false) {
         state.voiceStatusPermissionWarned = true;
       }
     });
+  return state.voiceStatusPromise;
 }
 
 function updateBotPresence() {
@@ -929,23 +943,100 @@ function createAudioPipeline(url, requiresCookies = false, youtubeMusicFallback 
   return { stream: output, cleanup, usedCookies };
 }
 
+function createAttachmentAudioPipeline(url) {
+  let intentionalShutdown = false;
+  let ffmpegErrors = '';
+  const output = new PassThrough();
+  const ffmpeg = spawn(ffmpegPath, [
+    '-nostdin', '-hide_banner', '-loglevel', 'error',
+    '-rw_timeout', '15000000',
+    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+    '-i', url, '-vn',
+    '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+  ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+
+  ffmpeg.stdout.pipe(output);
+  ffmpeg.stdout.on('error', (error) => {
+    if (!intentionalShutdown && !isExpectedPipeError(error)) output.destroy(error);
+  });
+  ffmpeg.stderr.on('data', (data) => {
+    ffmpegErrors = `${ffmpegErrors}${data}`.slice(-8000);
+    console.error(`ffmpeg attachment: ${data.toString().trim()}`);
+  });
+  ffmpeg.on('error', (error) => { if (!intentionalShutdown) output.destroy(error); });
+  ffmpeg.on('close', (code) => {
+    if (!intentionalShutdown && code !== 0) {
+      output.destroy(new Error(`FFmpeg attachment playback exited with code ${code}: ${ffmpegErrors}`));
+    }
+  });
+
+  let closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    intentionalShutdown = true;
+    ffmpeg.stdout?.unpipe(output);
+    output.destroy();
+    ffmpeg.kill();
+  };
+
+  return { stream: output, cleanup, usedCookies: false };
+}
+
+function probeAttachmentDuration(url) {
+  return new Promise((resolve) => {
+    let stderr = '';
+    let settled = false;
+    const ffmpeg = spawn(ffmpegPath, [
+      '-nostdin', '-hide_banner', '-loglevel', 'info',
+      '-rw_timeout', '10000000',
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      '-i', url, '-map', '0:a:0?', '-t', '0.01', '-f', 'null', '-',
+    ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const match = /Duration:\s*(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)/i.exec(stderr);
+      if (!match) return resolve(null);
+      const duration = (Number(match[1]) * 3600) + (Number(match[2]) * 60) + Number(match[3]);
+      resolve(Number.isFinite(duration) && duration > 0 ? duration : null);
+    };
+    const timeout = setTimeout(() => {
+      ffmpeg.kill();
+      finish();
+    }, 12_000);
+    timeout.unref();
+    ffmpeg.stderr.on('data', (data) => {
+      stderr = `${stderr}${data}`.slice(-16_000);
+    });
+    ffmpeg.on('error', finish);
+    ffmpeg.on('close', finish);
+  });
+}
+
 function clearIdleTimer(state) {
   if (state.idleTimer) clearTimeout(state.idleTimer);
   state.idleTimer = null;
 }
 
-function destroyQueue(guildId) {
+async function destroyQueue(guildId) {
   const state = guildQueues.get(guildId);
   if (!state) return;
   state.shuttingDown = true;
   if (state.current) state.current.intentionalStop = true;
   clearIdleTimer(state);
+  state.songs.length = 0;
+  state.nowPlaying = null;
+  guildQueues.delete(guildId);
+  // Clear the channel display while the voice connection still exists. Always
+  // write here so a stale remote status cannot survive a local state mismatch.
+  const statusClear = updateVoiceChannelStatus(state, true, true);
   state.current?.cleanup();
   state.player.stop(true);
+  await statusClear;
   state.connection.destroy();
-  state.nowPlaying = null;
-  updateVoiceChannelStatus(state, true);
-  guildQueues.delete(guildId);
   updateBotPresence();
 }
 
@@ -1012,7 +1103,9 @@ async function playNext(guildId) {
         return;
       }
     }
-    const pipeline = createAudioPipeline(song.url, song.requiresCookies, song.youtubeMusicFallback);
+    const pipeline = song.discordAttachment
+      ? createAttachmentAudioPipeline(song.url)
+      : createAudioPipeline(song.url, song.requiresCookies, song.youtubeMusicFallback);
     const generation = Symbol('playback');
     state.current = { ...pipeline, generation, startedAt: Date.now(), intentionalStop: false };
     state.player.play(createAudioResource(pipeline.stream, {
@@ -1215,7 +1308,7 @@ function waitForUserChoice(message, validChoices, timeoutMs = 45_000) {
   });
 }
 
-async function enqueueSong(message, song) {
+async function enqueueSong(message, song, insertAtFront = false) {
   let state;
   try {
     state = await getOrCreateQueue(message);
@@ -1228,8 +1321,11 @@ async function enqueueSong(message, song) {
   if (state.songs.length >= config.maxQueueSize) {
     return logAndReply(message, `The queue is full (${config.maxQueueSize} songs). Try again later.`);
   }
-  state.songs.push({ ...song, playbackAttempts: 0 });
-  await logAndReply(message, `📻 **Queued:** ${song.title} -- \`${formatDuration(song.duration)}\``);
+  const queuedSong = { ...song, playbackAttempts: 0 };
+  if (insertAtFront) state.songs.unshift(queuedSong);
+  else state.songs.push(queuedSong);
+  const action = insertAtFront ? 'Inserted at queue position 1' : 'Queued';
+  await logAndReply(message, `📻 **${action}:** ${song.title} -- \`${formatDuration(song.duration)}\``);
   playNext(message.guild.id);
 }
 
@@ -1259,7 +1355,7 @@ async function enqueueSongBatch(message, songs, title, label = 'Playlist') {
   playNext(message.guild.id);
 }
 
-async function handleSongRequest(message, url) {
+async function handleSongRequest(message, url, insertAtFront = false) {
   await warnAboutExpiredCookies(message);
   let song;
   try {
@@ -1268,11 +1364,12 @@ async function handleSongRequest(message, url) {
   } catch (error) {
     console.error('Error processing video:', error);
     if (isCookieError(error) && cookieStatus() !== 'active') {
-      return logAndReply(message, `This video needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+      await warnAboutExpiredCookies(message);
+      return logAndReply(message, 'That video requires YouTube login and could not be played.');
     }
     return logAndReply(message, 'There was an error trying to play the video.');
   }
-  return enqueueSong(message, song);
+  return enqueueSong(message, song, insertAtFront);
 }
 
 async function handlePlaylistRequest(message, url) {
@@ -1284,7 +1381,8 @@ async function handlePlaylistRequest(message, url) {
   } catch (error) {
     console.error('Error processing playlist:', error);
     if (isCookieError(error) && cookieStatus() !== 'active') {
-      return logAndReply(message, `This playlist needs YouTube login, but the bot's cookies are ${cookieStatus()}. A fresh \`cookies.txt\` is required.`);
+      await warnAboutExpiredCookies(message);
+      return logAndReply(message, 'That playlist requires YouTube login and could not be queued.');
     }
     return logAndReply(message, 'There was an error trying to queue the playlist.');
   }
@@ -1292,7 +1390,7 @@ async function handlePlaylistRequest(message, url) {
   return enqueueSongBatch(message, playlist.songs, playlist.title);
 }
 
-async function handleSearchRequest(message, query) {
+async function handleSearchRequest(message, query, insertAtFront = false) {
   const promptKey = `${message.guild.id}:${message.author.id}`;
   if (activePrompts.has(promptKey)) {
     return logAndReply(message, 'You already have a selection waiting. Reply with a number or `x` first.');
@@ -1311,13 +1409,14 @@ async function handleSearchRequest(message, query) {
     const choices = results.map((result, index) =>
       `**${index + 1}. ${result.title}** -- ${result.sourceChannel} -- ${formatDuration(result.duration)}`,
     ).join('\n');
-    await logAndReply(message, `🔎 **Choose a tune:** reply with **1-5**, or reply **x** to cancel.\n${choices}`);
+    const searchAction = insertAtFront ? 'Choose a tune to insert' : 'Choose a tune';
+    await logAndReply(message, `🔎 **${searchAction}:** reply with **1-5**, or reply **x** to cancel.\n${choices}`);
     const choice = await waitForUserChoice(message, ['1', '2', '3', '4', '5', 'x']);
     if (!choice) return logAndReply(message, 'Search timed out and was cancelled.');
     if (choice === 'x') return logAndReply(message, 'Search cancelled.');
     const selected = results[Number(choice) - 1];
     if (!selected) return logAndReply(message, 'That result is not available.');
-    return handleSongRequest(message, selected.url);
+    return handleSongRequest(message, selected.url, insertAtFront);
   } finally {
     activePrompts.delete(promptKey);
   }
@@ -1328,7 +1427,7 @@ async function handleSpotifyRequest(message, input) {
   const trackUrl = urls.find((item) => item.type === 'track');
   const playlistUrl = urls.find((item) => item.type === 'playlist');
   if (!trackUrl && !playlistUrl) {
-    return logAndReply(message, 'Provide a Spotify track or playlist URL after `-spotify`.');
+    return logAndReply(message, 'Provide a valid Spotify track or playlist URL after `-play` or `-p`.');
   }
 
   let selected = trackUrl || playlistUrl;
@@ -1395,7 +1494,7 @@ async function handleAppleMusicRequest(message, input) {
   const trackUrl = urls.find((item) => item.type === 'track');
   const playlistUrl = urls.find((item) => item.type === 'playlist');
   if (!trackUrl && !playlistUrl) {
-    return logAndReply(message, 'Provide an Apple Music song or playlist URL after `-applemusic`.');
+    return logAndReply(message, 'Provide a valid Apple Music song or playlist URL after `-play` or `-p`.');
   }
 
   let selected = trackUrl || playlistUrl;
@@ -1441,6 +1540,113 @@ async function handleAppleMusicRequest(message, input) {
   return enqueueSongBatch(message, appleSongs, details.title, 'Apple Music playlist');
 }
 
+function attachmentToQueueSong(attachment) {
+  const extensionMatch = /\.[a-z0-9]+$/i.exec(attachment.name || '');
+  const extension = extensionMatch?.[0].toLowerCase() || '';
+  const contentType = String(attachment.contentType || '').toLowerCase();
+  if (!playableAttachmentExtensions.has(extension)) {
+    return { error: 'That file type is not supported. Try MP3, M4A, WAV, FLAC, OGG, OPUS, AAC, WMA, WEBM, MP4, MOV, or MKV.' };
+  }
+  if (contentType && !contentType.startsWith('audio/') && !contentType.startsWith('video/')) {
+    return { error: 'That attachment is not identified as an audio or video file.' };
+  }
+  if (!Number.isFinite(attachment.size) || attachment.size <= 0 || attachment.size > config.maxUploadSize) {
+    return { error: `Attachments must be no larger than ${Math.floor(config.maxUploadSize / 1024 / 1024)} MiB.` };
+  }
+
+  let attachmentUrl;
+  try {
+    attachmentUrl = new URL(attachment.url);
+  } catch {
+    return { error: 'That attachment does not have a valid download URL.' };
+  }
+  if (attachmentUrl.protocol !== 'https:' || !discordAttachmentHosts.has(attachmentUrl.hostname.toLowerCase())) {
+    return { error: 'For safety, file playback accepts only files attached directly to this Discord message.' };
+  }
+
+  const title = (attachment.name || 'Uploaded track').replace(/\.[^.]+$/, '').slice(0, 200) || 'Uploaded track';
+  return {
+    song: {
+      title,
+      url: attachmentUrl.toString(),
+      duration: null,
+      discordAttachment: true,
+    },
+  };
+}
+
+async function inspectDiscordAttachmentUrl(input) {
+  let attachmentUrl;
+  try {
+    attachmentUrl = new URL(sanitizeUrlInput(input));
+  } catch {
+    return { error: 'That is not a valid Discord attachment link.' };
+  }
+  if (attachmentUrl.protocol !== 'https:' || !discordAttachmentHosts.has(attachmentUrl.hostname.toLowerCase())) {
+    return { error: 'For safety, `-fileplay` links must come from Discord attachments.' };
+  }
+
+  let name;
+  try {
+    name = decodeURIComponent(attachmentUrl.pathname.split('/').filter(Boolean).at(-1) || 'Discord upload');
+  } catch {
+    name = attachmentUrl.pathname.split('/').filter(Boolean).at(-1) || 'Discord upload';
+  }
+
+  let response;
+  try {
+    response = await fetch(attachmentUrl, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (error) {
+    console.error('Could not inspect Discord attachment link:', errorText(error));
+    return { error: 'I could not verify that Discord attachment link.' };
+  }
+  const finalUrl = new URL(response.url);
+  if (!response.ok || finalUrl.protocol !== 'https:' || !discordAttachmentHosts.has(finalUrl.hostname.toLowerCase())) {
+    return { error: 'That Discord attachment link is unavailable or no longer valid.' };
+  }
+
+  const size = Number(response.headers.get('content-length'));
+  if (!Number.isFinite(size) || size <= 0) {
+    return { error: 'Discord did not report the file size, so I cannot safely play that link.' };
+  }
+  return {
+    attachment: {
+      name,
+      contentType: response.headers.get('content-type'),
+      size,
+      url: finalUrl.toString(),
+    },
+  };
+}
+
+async function handleFilePlayRequest(message, input) {
+  if (message.attachments.size && input) {
+    return logAndReply(message, 'Use either one attached file or one Discord attachment link, not both.');
+  }
+  if (!message.attachments.size && !input) {
+    return logAndReply(message, 'Attach one media file or paste one Discord attachment link after `-fileplay` or `-fp`.');
+  }
+  if (message.attachments.size > 1) {
+    return logAndReply(message, '`-fileplay` accepts exactly one attached file at a time.');
+  }
+  let attachment = message.attachments.first();
+  if (!attachment) {
+    const inspection = await inspectDiscordAttachmentUrl(input);
+    if (inspection.error) return logAndReply(message, inspection.error);
+    attachment = inspection.attachment;
+  }
+  const result = attachmentToQueueSong(attachment);
+  if (result.error) return logAndReply(message, result.error);
+  result.song.duration = await probeAttachmentDuration(result.song.url);
+  if (!result.song.duration) {
+    console.warn(`[FILEPLAY] Could not determine duration for ${result.song.title}; playback will continue without a total timestamp.`);
+  }
+  return enqueueSong(message, result.song);
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -1457,22 +1663,22 @@ client.on('messageCreate', async (message) => {
 
   if (command === 'play' || command === 'p') {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
-    const url = args[0];
-    if (!url) return logAndReply(message, 'You need to provide a YouTube URL to play a song!');
+    const input = args.join(' ').trim();
+    if (!input) return logAndReply(message, 'You need to provide a YouTube URL or some search text!');
     let parsedInput;
     try {
-      parsedInput = new URL(sanitizeUrlInput(url));
+      parsedInput = new URL(sanitizeUrlInput(input));
       if (!['http:', 'https:'].includes(parsedInput.protocol)) throw new Error('Unsupported protocol');
     } catch {
-      return logAndReply(message, "That's not a link. If you're trying to search with plain text, please use `-search <words>`.");
+      return handleSearchRequest(message, input);
     }
     if (parsedInput.hostname.toLowerCase() === 'open.spotify.com') {
-      return logAndReply(message, 'That is a Spotify link. Use `-spotify <URL>` to queue Spotify songs or playlists.');
+      return handleSpotifyRequest(message, input);
     }
     if (parsedInput.hostname.toLowerCase() === 'music.apple.com') {
-      return logAndReply(message, 'That is an Apple Music link. Use `-applemusic <URL>` to queue Apple Music songs or playlists.');
+      return handleAppleMusicRequest(message, input);
     }
-    const playlistType = classifyYouTubePlaylistInput(url);
+    const playlistType = classifyYouTubePlaylistInput(input);
     if (playlistType === 'playlist') {
       return logAndReply(message, 'That link contains a playlist. Use `-pl <URL>` or `-playlist <URL>` to queue it.');
     }
@@ -1492,9 +1698,9 @@ client.on('messageCreate', async (message) => {
       }
       if (!choice) return logAndReply(message, 'Playlist choice timed out and was cancelled.');
       if (choice === 'x') return logAndReply(message, 'Request cancelled.');
-      if (choice === 'p') return handlePlaylistRequest(message, url);
+      if (choice === 'p') return handlePlaylistRequest(message, input);
     }
-    return handleSongRequest(message, url);
+    return handleSongRequest(message, input);
   }
 
   if (command === 'playlist' || command === 'pl') {
@@ -1504,25 +1710,32 @@ client.on('messageCreate', async (message) => {
     return handlePlaylistRequest(message, url);
   }
 
-  if (command === 'search') {
-    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to search for music!');
-    const query = args.join(' ').trim();
-    if (!query) return logAndReply(message, 'You need to provide something to search for!');
-    return handleSearchRequest(message, query);
+  if (command === 'insert' || command === 'i') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to insert music!');
+    const input = args.join(' ').trim();
+    if (!input) return logAndReply(message, 'Provide one YouTube song URL or some search text after `-insert`.');
+    let parsedInput;
+    try {
+      parsedInput = new URL(sanitizeUrlInput(input));
+      if (!['http:', 'https:'].includes(parsedInput.protocol)) throw new Error('Unsupported protocol');
+    } catch {
+      return handleSearchRequest(message, input, true);
+    }
+    if (parsedInput.hostname.toLowerCase() === 'open.spotify.com') {
+      return logAndReply(message, '`-insert` currently accepts one YouTube song URL, not Spotify links.');
+    }
+    if (parsedInput.hostname.toLowerCase() === 'music.apple.com') {
+      return logAndReply(message, '`-insert` currently accepts one YouTube song URL, not Apple Music links.');
+    }
+    if (classifyYouTubePlaylistInput(input) === 'playlist') {
+      return logAndReply(message, '`-insert` accepts one song only, not a dedicated playlist.');
+    }
+    return handleSongRequest(message, input, true);
   }
 
-  if (command === 'spotify') {
-    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue Spotify music!');
-    const input = args.join(' ').trim();
-    if (!input) return logAndReply(message, 'Provide a Spotify track or playlist URL after `-spotify`.');
-    return handleSpotifyRequest(message, input);
-  }
-
-  if (command === 'applemusic' || command === 'apple') {
-    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to queue Apple Music!');
-    const input = args.join(' ').trim();
-    if (!input) return logAndReply(message, 'Provide an Apple Music song or playlist URL after `-applemusic`.');
-    return handleAppleMusicRequest(message, input);
+  if (command === 'fileplay' || command === 'fp') {
+    if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play an attached file!');
+    return handleFilePlayRequest(message, args.join(' ').trim());
   }
 
   if (command === 'skip' || command === 's') {
@@ -1538,7 +1751,7 @@ client.on('messageCreate', async (message) => {
 
   if (command === 'leave' || command === 'l') {
     if (!guildQueues.has(message.guild.id)) return logAndReply(message, 'I am not in a voice channel.');
-    destroyQueue(message.guild.id);
+    await destroyQueue(message.guild.id);
     return logAndReply(message, '👋 **Grunko has left the stage:** voice disconnected and queue cleared.');
   }
 
@@ -1572,29 +1785,36 @@ client.on('messageCreate', async (message) => {
 
   if (command === 'health') {
     const status = cookieStatus();
+    const ownerRequest = message.author.id === config.ownerUserId;
     const cookieMessage = status === 'active'
       ? 'YouTube cookies are active.'
       : status === 'expired'
-        ? 'YouTube cookies appear expired; public-video fallback is active.'
-        : 'YouTube cookies are missing; public videos may still work.';
+        ? ownerRequest
+          ? 'YouTube cookies appear expired; public-video fallback is active.'
+          : 'YouTube authentication maintenance has been reported to Sparrow; public-video fallback is active.'
+        : ownerRequest
+          ? 'YouTube cookies are missing; public videos may still work.'
+          : 'YouTube authentication is unavailable; public videos may still work.';
     return logAndReply(message, `🩺 **Grunko health:** music systems are online. ${cookieMessage}`);
   }
 
   if (command === 'help' || command === 'h') {
     return logAndReply(message,
-      '🎛️ **Grunko Music Commands**\n' +
-      '`-play <URL>` or `-p <URL>` - Plays the requested song\n' +
-      '`-search <words>` - Searches YouTube and offers five choices\n' +
-      '`-spotify <URL>` - Queues a Spotify song or playlist\n' +
-      '`-applemusic <URL>` or `-apple <URL>` - Queues an Apple Music song or playlist\n' +
-      '`-playlist <URL>` or `-pl <URL>` - Adds a YouTube playlist\n' +
-      '`-skip` or `-s` - Skips the current song\n' +
-      '`-leave` or `-l` - Disconnects bot from the voice channel\n' +
-      '`-shuffle` - Shuffles the current queue\n' +
-      '`-queue` or `-q` - Lists the current queue\n' +
-      '`-playing` or `-np` - Displays the current song and playback timestamp\n' +
-      '`-health` - Displays playback and YouTube cookie health\n' +
-      '`-help` or `-h` - Displays this help message');
+      '🎛️ **Grunko Music Commands**\n\n' +
+      '**Start the show**\n' +
+      '`-play` / `-p` `<text or URL>` -- Search or play YouTube, Spotify, and Apple Music\n' +
+      '`-playlist` / `-pl` `<YouTube URL>` -- Queue a dedicated YouTube playlist\n' +
+      '`-fileplay` / `-fp` + attachment or Discord link -- Play one uploaded media file\n\n' +
+      '**Shape the queue**\n' +
+      '`-insert` / `-i` `<text or URL>` -- Put one YouTube song next in line\n' +
+      '`-skip` / `-s` -- Move to the next song\n' +
+      '`-shuffle` -- Shuffle upcoming songs\n' +
+      '`-queue` / `-q` -- Show upcoming songs\n\n' +
+      '**Stage controls**\n' +
+      '`-playing` / `-np` -- Show the current song and timestamp\n' +
+      '`-leave` / `-l` -- Leave voice and clear the queue\n' +
+      '`-health` -- Check playback and YouTube authentication\n' +
+      '`-help` / `-h` -- Show this command board');
   }
 });
 

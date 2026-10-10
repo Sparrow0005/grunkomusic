@@ -33,11 +33,10 @@ Administrator and moderation permissions are not required. Channel-specific over
 
 | Command | Purpose |
 | --- | --- |
-| `-play <URL>` / `-p <URL>` | Play one YouTube video |
-| `-search <words>` | Show five ranked YouTube results |
+| `-play <URL or text>` / `-p <URL or text>` | Search or play YouTube, Spotify, and Apple Music |
 | `-playlist <URL>` / `-pl <URL>` | Queue a YouTube playlist |
-| `-spotify <URL>` | Queue a public Spotify track or playlist |
-| `-applemusic <URL>` / `-apple <URL>` | Queue a public Apple Music song or playlist |
+| `-insert <URL or text>` / `-i <URL or text>` | Insert one song at queue position 1 |
+| `-fileplay` / `-fp` with an attachment or Discord attachment URL | Play one uploaded media file up to 25 MiB |
 | `-skip` / `-s` | Skip the current song |
 | `-leave` / `-l` | Disconnect and clear the server queue |
 | `-shuffle` | Shuffle upcoming songs |
@@ -48,12 +47,16 @@ Administrator and moderation permissions are not required. Channel-specific over
 
 Search selections accept `1` through `5`, or `x` to cancel. Queue displays use buttons when more than 10 songs are waiting.
 
+`-insert` accepts a YouTube video URL or plain search text. A text search offers five choices and inserts exactly one selected song. It does not interrupt the current song; it places the requested song first among the upcoming tracks and shifts the existing queue back one position.
+
 ## Link handling
 
 - YouTube radio links ending in `start_radio=1` are normalized to one song.
 - A dedicated `/playlist` URL is accepted by `-playlist`.
 - A `/watch` URL inside a normal playlist asks whether to queue the song or playlist.
-- Plain text sent to `-play` is redirected to `-search`.
+- Plain text sent to `-play` or `-p` opens a five-result chooser.
+- Spotify and Apple Music song and playlist links are accepted directly by `-play` or `-p`.
+- File playback accepts one attached file or pasted Discord attachment URL from a restricted audio/video format list, up to 25 MiB.
 - Spotify and Apple Music provide metadata only. Playback uses a title-, artist-, and duration-matched YouTube source.
 - External playlists are limited to 100 queued songs.
 
@@ -69,7 +72,7 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 - Metadata, voice connection, and playback operations use bounded retries.
 - The bot tries public YouTube access first and only uses cookies when authentication is required.
 - Cookies that still receive an authentication challenge are marked unhealthy.
-- Users are warned about unhealthy cookies only when they request playback, with a cooldown to prevent spam.
+- Cookie maintenance warnings are directed only to the application owner, Sparrow. If another user discovers expired cookies through playback, the bot mentions Sparrow and gives the requester only a generic playback failure. Owner and discovery warnings have separate cooldowns to prevent spam.
 - Unavailable playlist entries may be replaced only by a context-matched result.
 - Spotify and Apple Music matches require strong title, artist, and duration agreement.
 - yt-dlp checks for updates at startup, once daily, and after recognized extractor failures.
