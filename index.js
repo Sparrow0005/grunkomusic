@@ -1440,14 +1440,14 @@ async function handleSpotifyRequest(message, input) {
     let choice;
     try {
       await logAndReply(message,
-        '🎛️ **Spotify choice:** reply **s** for the song, **p** for the playlist, or **x** to cancel.');
-      choice = await waitForUserChoice(message, ['s', 'p', 'x']);
+        '🎛️ **Spotify choice:** reply **1** for the song, **2** for the playlist, or **3** to cancel.');
+      choice = await waitForUserChoice(message, ['1', '2', '3']);
     } finally {
       activePrompts.delete(promptKey);
     }
     if (!choice) return logAndReply(message, 'Spotify choice timed out and was cancelled.');
-    if (choice === 'x') return logAndReply(message, 'Spotify request cancelled.');
-    selected = choice === 's' ? trackUrl : playlistUrl;
+    if (choice === '3') return logAndReply(message, 'Spotify request cancelled.');
+    selected = choice === '1' ? trackUrl : playlistUrl;
   }
 
   if (selected.type === 'track') {
@@ -1505,14 +1505,14 @@ async function handleAppleMusicRequest(message, input) {
     let choice;
     try {
       await logAndReply(message,
-        '🎛️ **Apple Music choice:** reply **s** for the song, **p** for the playlist, or **x** to cancel.');
-      choice = await waitForUserChoice(message, ['s', 'p', 'x']);
+        '🎛️ **Apple Music choice:** reply **1** for the song, **2** for the playlist, or **3** to cancel.');
+      choice = await waitForUserChoice(message, ['1', '2', '3']);
     } finally {
       activePrompts.delete(promptKey);
     }
     if (!choice) return logAndReply(message, 'Apple Music choice timed out and was cancelled.');
-    if (choice === 'x') return logAndReply(message, 'Apple Music request cancelled.');
-    selected = choice === 's' ? trackUrl : playlistUrl;
+    if (choice === '3') return logAndReply(message, 'Apple Music request cancelled.');
+    selected = choice === '1' ? trackUrl : playlistUrl;
   }
 
   let details;
@@ -1691,14 +1691,14 @@ client.on('messageCreate', async (message) => {
       let choice;
       try {
         await logAndReply(message,
-          '🎛️ **Pick what Grunko should play:** reply **p** for the whole playlist, **s** for only this song, or **x** to cancel.');
-        choice = await waitForUserChoice(message, ['p', 's', 'x']);
+          '🎛️ **Pick what Grunko should play:** reply **1** for only this song, **2** for the whole playlist, or **3** to cancel.');
+        choice = await waitForUserChoice(message, ['1', '2', '3']);
       } finally {
         activePrompts.delete(promptKey);
       }
       if (!choice) return logAndReply(message, 'Playlist choice timed out and was cancelled.');
-      if (choice === 'x') return logAndReply(message, 'Request cancelled.');
-      if (choice === 'p') return handlePlaylistRequest(message, input);
+      if (choice === '3') return logAndReply(message, 'Request cancelled.');
+      if (choice === '2') return handlePlaylistRequest(message, input);
     }
     return handleSongRequest(message, input);
   }
