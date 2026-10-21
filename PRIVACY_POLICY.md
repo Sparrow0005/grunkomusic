@@ -28,7 +28,7 @@ Depending on how you use the Bot, it may process:
 - song titles, artist names, channel names, durations, queue state, and playback status; and
 - button interactions used to navigate long queues.
 
-Discord may deliver message events to the Bot because it uses the Message Content privileged intent. The Bot's command handler ignores messages from bots, direct messages, and guild messages that do not begin with its command prefix. During an active selection prompt, it temporarily reads replies from the requesting user in the same channel to identify a valid choice.
+Discord may deliver message events to the Bot because it uses the Message Content privileged intent. The Bot's public command handler ignores messages from bots and guild messages that do not begin with its command prefix. During an active selection prompt, it temporarily reads replies from the requesting user in the same channel to identify a valid choice. Direct messages are ignored unless they come from the configured owner account. Owner DMs are processed only for help, cookie verification, and secure cookie replacement.
 
 ### Attachments
 
@@ -42,7 +42,7 @@ The Bot also stores small local maintenance files containing update timestamps a
 
 ### Operator credentials
 
-The Bot uses its own Discord token and optional YouTube cookies supplied by the operator. These are not user data, are excluded from the public repository, and are not requested from Bot users. Never send your Discord password, token, browser cookies, or other login credentials to the Bot.
+The Bot uses its own Discord token and optional YouTube cookies supplied by the operator. These are not ordinary user data and are excluded from the public repository. The configured owner may replace the YouTube cookie file by sending the Bot the `cookies` command with one attachment in a Discord DM; the leading dash is optional in owner DMs. The Bot restricts this feature to the owner's stable Discord user ID, validates the Discord-hosted attachment and Netscape cookie format, installs it locally, and tests whether YouTube accepts it for an authentication-required video. The owner may also request that check with `test` in a DM or `-test` in a server. The Bot does not log cookie contents or attachment URLs. Other users must never send passwords, tokens, browser cookies, or other login credentials to the Bot.
 
 ## 3. How information is used
 
@@ -82,7 +82,8 @@ The Bot minimizes retention as follows:
 - uploaded media is streamed for inspection and playback and is not intentionally stored as a local media file;
 - Discord itself controls retention of messages and attachments on its service;
 - operational logs are stored locally, rotate when they exceed 10 MiB, and may remain in the current log and one rotated backup until overwritten or manually deleted; and
-- maintenance and cookie-health records remain until replaced, reset, or no longer needed to operate the Bot.
+- maintenance and cookie-health records remain until replaced, reset, or no longer needed to operate the Bot; and
+- the operator's accepted YouTube cookie file remains on the host until replaced, removed, or no longer needed.
 
 We may retain information longer when required by law, needed to investigate abuse or a security incident, or necessary to establish or defend legal claims. When the Bot permanently ceases operation, locally retained Discord API data will be deleted unless retention is legally required.
 

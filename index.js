@@ -8,6 +8,7 @@ const {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  Partials,
   ActivityType,
   Routes,
 } = require('discord.js');
@@ -36,6 +37,7 @@ const playableAttachmentExtensions = new Set([
   '.aac', '.flac', '.m4a', '.mkv', '.mov', '.mp3', '.mp4', '.ogg', '.opus', '.wav', '.webm', '.wma',
 ]);
 const discordAttachmentHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+const maxCookieUploadSize = 2 * 1024 * 1024;
 
 function readLastYtdlpUpdateAttempt() {
   try {
@@ -127,20 +129,154 @@ function markCookiesUnhealthy(error) {
   console.error('[RECOVERY] cookies.txt appears expired or rejected; public playback will fall back to cookie-free mode.');
 }
 
-async function warnAboutExpiredCookies(message) {
+async function notifyOwnerAboutCookieFailure() {
   if (cookieStatus() !== 'expired') return;
-  const ownerRequest = message.author.id === config.ownerUserId;
-  const warningKey = ownerRequest ? 'lastOwnerWarningAt' : 'lastDiscoveryWarningAt';
-  if (cookieHealth[warningKey] &&
-      Date.now() - cookieHealth[warningKey] < config.cookieWarningCooldown) return;
-  cookieHealth[warningKey] = Date.now();
+  if (cookieHealth.lastOwnerDmAt &&
+      Date.now() - cookieHealth.lastOwnerDmAt < config.cookieWarningCooldown) return;
+  cookieHealth.lastOwnerDmAt = Date.now();
   writeCookieHealth();
-  if (ownerRequest) {
-    await logAndReply(message, 'YouTube login cookies appear to be expired. I’ll still try public videos, but restricted videos need a refreshed `cookies.txt`.');
-    return;
+  try {
+    const owner = await client.users.fetch(config.ownerUserId);
+    await owner.send(
+      '⚠️ **Grunko cookie check failed:** a YouTube download required authentication and the saved cookies were rejected. ' +
+      'DM me `-cookies` with one fresh Netscape-format cookie file attached to replace them. Public-video fallback remains available.',
+    );
+    console.log('[RECOVERY] Sent the owner a private cookie-maintenance alert.');
+  } catch (error) {
+    console.error('[RECOVERY] Could not DM the owner about rejected cookies:', errorText(error));
   }
-  await logAndSend(message.channel,
-    `<@${config.ownerUserId}>, Grunko discovered that the YouTube login cookies are expired. Please refresh \`cookies.txt\` when you can.`);
+}
+
+function validateCookieFile(content) {
+  const text = String(content || '').replace(/^\uFEFF/, '');
+  const lines = text.split(/\r?\n/);
+  const headerOk = lines.slice(0, 5).some((line) => /Netscape HTTP Cookie File/i.test(line));
+  const cookieRows = lines.filter((line) =>
+    line && (!line.startsWith('#') || line.startsWith('#HttpOnly_')) && line.split('\t').length >= 7);
+  const youtubeRows = cookieRows.filter((line) => {
+    const domain = line.split('\t')[0].replace(/^#HttpOnly_/, '').replace(/^\./, '').toLowerCase();
+    return domain === 'youtube.com' || domain.endsWith('.youtube.com') ||
+      domain === 'google.com' || domain.endsWith('.google.com');
+  });
+  if (!headerOk || !cookieRows.length || !youtubeRows.length) {
+    return { valid: false, error: 'That file is not a valid Netscape-format YouTube cookie export.' };
+  }
+  return { valid: true, text, cookieCount: youtubeRows.length };
+}
+
+async function verifyYouTubeCookies() {
+  if (!fs.existsSync(config.cookiesFilePath)) {
+    return { ok: false, message: 'No cookie file is installed.' };
+  }
+  try {
+    const info = await ytdlp(config.cookieVerificationUrl, {
+      dumpSingleJson: true,
+      skipDownload: true,
+      noPlaylist: true,
+      noWarnings: true,
+      quiet: true,
+      socketTimeout: 15,
+      cookies: config.cookiesFilePath,
+      ...youtubeChallengeOptions(),
+    });
+    if (!info?.id || Number(info.age_limit) < 18 || !Array.isArray(info.formats) || !info.formats.length) {
+      throw new Error('The authentication test did not return playable age-restricted media formats.');
+    }
+    cookieHealth = {};
+    writeCookieHealth();
+    updateBotPresence();
+    console.log('[COOKIE TEST] YouTube accepted the saved cookies for the authentication-required test video.');
+    return { ok: true, message: 'YouTube accepted the cookies for an authentication-required video.' };
+  } catch (error) {
+    markCookiesUnhealthy(error);
+    updateBotPresence();
+    console.error('[COOKIE TEST] YouTube cookie verification failed:', errorText(error));
+    return { ok: false, message: 'YouTube rejected the cookies during an authentication-required video check.' };
+  }
+}
+
+async function sendPrivateCookieTestResult(message) {
+  const result = await verifyYouTubeCookies();
+  const resultText = result.ok
+    ? `🩺 **Cookie test passed:** ${result.message} Full service is active.`
+    : `⚠️ **Cookie test failed:** ${result.message} Public fallback remains active.`;
+  if (!message.guild) return message.reply(resultText);
+  try {
+    await message.author.send(resultText);
+    return logAndReply(message, '🩺 **Private cookie test complete:** I sent the result to Sparrow by DM.');
+  } catch (error) {
+    console.error('[COOKIE TEST] Could not DM the owner test result:', errorText(error));
+    return logAndReply(message, '⚠️ I completed the private cookie test, but could not DM Sparrow the result.');
+  }
+}
+
+async function handleOwnerDm(message) {
+  if (message.author.id !== config.ownerUserId) return;
+  const [rawCommand = ''] = message.content.trim().split(/\s+/);
+  const command = rawCommand.toLowerCase().replace(/^-/, '');
+
+  if (command === 'help' || command === 'h') {
+    return message.reply(
+      '🎛️ **Owner DM commands**\n' +
+      '`cookies` + one attached Netscape cookie file -- replace and verify YouTube cookies\n' +
+      '`test` -- privately verify the installed cookies',
+    );
+  }
+  if (command === 'test') return sendPrivateCookieTestResult(message);
+  if (command !== 'cookies') {
+    return message.reply('🎛️ DM `cookies` with one Netscape-format cookie file attached, or say `test` to verify the installed file.');
+  }
+  if (message.attachments.size !== 1) {
+    return message.reply('⚠️ Attach exactly one Netscape-format cookie file to the `cookies` message.');
+  }
+
+  const attachment = message.attachments.first();
+  if (!Number.isFinite(attachment.size) || attachment.size <= 0 || attachment.size > maxCookieUploadSize) {
+    return message.reply('⚠️ The cookie file must be non-empty and no larger than 2 MiB.');
+  }
+  let attachmentUrl;
+  try {
+    attachmentUrl = new URL(attachment.url);
+  } catch {
+    return message.reply('⚠️ That attachment does not have a valid download URL.');
+  }
+  if (attachmentUrl.protocol !== 'https:' || !discordAttachmentHosts.has(attachmentUrl.hostname.toLowerCase())) {
+    return message.reply('⚠️ For safety, cookies must be attached directly to this Discord DM.');
+  }
+
+  let cookieText;
+  try {
+    const response = await fetch(attachmentUrl, { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) throw new Error(`Discord returned HTTP ${response.status}`);
+    cookieText = await response.text();
+  } catch (error) {
+    console.error('[COOKIE DM] Could not download the owner cookie attachment:', errorText(error));
+    return message.reply('⚠️ I could not download that attachment. Please attach it again.');
+  }
+  if (Buffer.byteLength(cookieText, 'utf8') > maxCookieUploadSize) {
+    return message.reply('⚠️ The downloaded cookie file exceeds the 2 MiB safety limit.');
+  }
+  const validation = validateCookieFile(cookieText);
+  if (!validation.valid) return message.reply(`⚠️ ${validation.error}`);
+
+  try {
+    fs.writeFileSync(config.cookiesFilePath, validation.text, { encoding: 'utf8', mode: 0o600 });
+    cookieHealth = {};
+    writeCookieHealth();
+  } catch (error) {
+    console.error('[COOKIE DM] Could not install the owner cookie attachment:', errorText(error));
+    return message.reply('⚠️ The cookie file was valid, but I could not install it on the host.');
+  }
+  console.log(`[COOKIE DM] Installed a validated replacement cookie file containing ${validation.cookieCount} YouTube/Google records.`);
+  const testResult = await verifyYouTubeCookies();
+  if (testResult.ok) {
+    return message.reply(
+      `🛠️ **Cookies refreshed and verified:** installed ${validation.cookieCount} validated YouTube/Google records. Full service is active.`,
+    );
+  }
+  return message.reply(
+    `⚠️ **Cookies installed but verification failed:** installed ${validation.cookieCount} records, but YouTube rejected the authentication test. Public fallback remains active.`,
+  );
 }
 
 async function updateYtdlp(reason = 'scheduled maintenance') {
@@ -410,19 +546,32 @@ function updateVoiceChannelStatus(state, force = false, alwaysWrite = false) {
   return state.voiceStatusPromise;
 }
 
+function formatUptime() {
+  const totalMinutes = Math.max(0, Math.floor(process.uptime() / 60));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
 function updateBotPresence() {
   if (!client.user) return;
-  // A bot has one global presence, so keep it private and show only an active-server count.
+  // Keep the public health indicator privacy-safe: uptime and aggregate server
+  // count only. Authentication details are sent privately to the owner.
   const activeStates = [...guildQueues.values()]
     .filter((state) => state.nowPlaying)
     .sort((a, b) => (b.current?.startedAt || 0) - (a.current?.startedAt || 0));
   for (const state of activeStates) updateVoiceChannelStatus(state);
+  const serviceMode = cookieStatus() === 'active' ? 'full service' : 'public fallback';
+  const healthText = `${serviceMode} • up ${formatUptime()}`;
   if (!activeStates.length) {
-    client.user.setActivity('requests | -help', { type: ActivityType.Listening });
+    client.user.setActivity(`${healthText} • -help`, { type: ActivityType.Listening });
     return;
   }
   const serverLabel = activeStates.length === 1 ? 'server' : 'servers';
-  client.user.setActivity(`music in ${activeStates.length} ${serverLabel}`, { type: ActivityType.Playing });
+  client.user.setActivity(`music in ${activeStates.length} ${serverLabel} • ${healthText}`, { type: ActivityType.Playing });
 }
 
 function musicSearchScore(entry, index, query) {
@@ -1216,6 +1365,7 @@ async function initializeQueue(message) {
     }
     if (state.current?.usedCookies && isCookieRejectionError(error)) {
       markCookiesUnhealthy(error);
+      await notifyOwnerAboutCookieFailure();
     }
     if (isPermanentMediaError(error) && !song.youtubeMusicFallbackAttempted) {
       song.youtubeMusicFallbackAttempted = true;
@@ -1356,15 +1506,13 @@ async function enqueueSongBatch(message, songs, title, label = 'Playlist') {
 }
 
 async function handleSongRequest(message, url, insertAtFront = false) {
-  await warnAboutExpiredCookies(message);
   let song;
   try {
     song = await resolveSong(url);
-    await warnAboutExpiredCookies(message);
   } catch (error) {
     console.error('Error processing video:', error);
     if (isCookieError(error) && cookieStatus() !== 'active') {
-      await warnAboutExpiredCookies(message);
+      await notifyOwnerAboutCookieFailure();
       return logAndReply(message, 'That video requires YouTube login and could not be played.');
     }
     return logAndReply(message, 'There was an error trying to play the video.');
@@ -1373,15 +1521,13 @@ async function handleSongRequest(message, url, insertAtFront = false) {
 }
 
 async function handlePlaylistRequest(message, url) {
-  await warnAboutExpiredCookies(message);
   let playlist;
   try {
     playlist = await resolvePlaylist(url, config.maxQueueSize);
-    await warnAboutExpiredCookies(message);
   } catch (error) {
     console.error('Error processing playlist:', error);
     if (isCookieError(error) && cookieStatus() !== 'active') {
-      await warnAboutExpiredCookies(message);
+      await notifyOwnerAboutCookieFailure();
       return logAndReply(message, 'That playlist requires YouTube login and could not be queued.');
     }
     return logAndReply(message, 'There was an error trying to queue the playlist.');
@@ -1652,14 +1798,23 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
   ],
+  partials: [Partials.Channel],
 });
 
 client.on('messageCreate', async (message) => {
-  if (!message.guild || message.author.bot || !message.content.startsWith(prefix)) return;
+  if (message.author.bot) return;
+  if (!message.guild) return handleOwnerDm(message);
+  if (!message.content.startsWith(prefix)) return;
   const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const command = args.shift()?.toLowerCase();
+
+  if (command === 'test') {
+    if (message.author.id !== config.ownerUserId) return;
+    return sendPrivateCookieTestResult(message);
+  }
 
   if (command === 'play' || command === 'p') {
     if (!message.member.voice.channel) return logAndReply(message, 'You need to be in a voice channel to play music!');
@@ -1794,21 +1949,6 @@ client.on('messageCreate', async (message) => {
     return logAndReply(message, `🎶 **Grunko is playing:** ${song.title} -- \`${playbackProgress(state)}\``);
   }
 
-  if (command === 'health') {
-    const status = cookieStatus();
-    const ownerRequest = message.author.id === config.ownerUserId;
-    const cookieMessage = status === 'active'
-      ? 'YouTube cookies are active.'
-      : status === 'expired'
-        ? ownerRequest
-          ? 'YouTube cookies appear expired; public-video fallback is active.'
-          : 'YouTube authentication maintenance has been reported to Sparrow; public-video fallback is active.'
-        : ownerRequest
-          ? 'YouTube cookies are missing; public videos may still work.'
-          : 'YouTube authentication is unavailable; public videos may still work.';
-    return logAndReply(message, `🩺 **Grunko health:** music systems are online. ${cookieMessage}`);
-  }
-
   if (command === 'help' || command === 'h') {
     return logAndReply(message,
       '🎛️ **Grunko Music Commands**\n\n' +
@@ -1825,7 +1965,6 @@ client.on('messageCreate', async (message) => {
       '**Stage controls**\n' +
       '`-playing` / `-np` -- Show the current song and timestamp\n' +
       '`-leave` / `-l` -- Leave voice and clear the queue\n' +
-      '`-health` -- Check playback and YouTube authentication\n' +
       '`-help` / `-h` -- Show this command board');
   }
 });
@@ -1850,7 +1989,7 @@ client.on('interactionCreate', async (interaction) => {
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
   updateBotPresence();
-  presenceTimer = setInterval(updateBotPresence, 15_000);
+  presenceTimer = setInterval(updateBotPresence, 60_000);
   presenceTimer.unref();
   updateYtdlp('startup maintenance');
   setInterval(() => updateYtdlp('scheduled daily maintenance'), config.ytdlpUpdateInterval).unref();

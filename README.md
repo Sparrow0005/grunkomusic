@@ -45,7 +45,6 @@ Administrator and moderation permissions are not required. Channel-specific over
 | `-shuffle` | Shuffle upcoming songs |
 | `-queue` / `-q` | Show upcoming songs and durations |
 | `-playing` / `-np` | Show the current song and elapsed/total time |
-| `-health` | Report bot and cookie health |
 | `-help` / `-h` | Show the command list |
 
 Search selections accept `1` through `5`, or `x` to cancel. Queue displays use buttons when more than 10 songs are waiting.
@@ -65,7 +64,7 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 
 ## Status and privacy
 
-- The public bot presence only reports `Playing music in X server(s)`.
+- Discord's native presence indicates whether the bot is online or offline. Its profile activity refreshes once per minute with `full service` or `public fallback`, uptime, and aggregate active-server count. It never exposes cookie details or listener identities.
 - Each active voice channel shows its own song and timestamp status.
 - `-playing` and `-queue` are isolated per server.
 - Voice-channel status is cleared when playback stops or the bot leaves.
@@ -75,7 +74,9 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 - Metadata, voice connection, and playback operations use bounded retries.
 - The bot tries public YouTube access first and only uses cookies when authentication is required.
 - Cookies that still receive an authentication challenge are marked unhealthy.
-- Cookie maintenance warnings are directed only to the application owner, Sparrow. If another user discovers expired cookies through playback, the bot mentions Sparrow and gives the requester only a generic playback failure. Owner and discovery warnings have separate cooldowns to prevent spam.
+- Cookie expiration is never announced in a server. After an authentication-related download failure, the bot privately DMs `@sparrow05` at most once every 24 hours.
+- Only the configured owner Discord ID can replace cookies by DM using `cookies` with one attached Netscape-format cookie file. A leading dash is optional in owner DMs. The file is validated before installation, immediately tested against an authentication-required YouTube video, and its contents are never logged.
+- The owner can say `test` in a DM or use `-test` in a server to run the same private cookie check. Server results are sent to the owner by DM.
 - Unavailable playlist entries may be replaced only by a context-matched result.
 - Spotify and Apple Music matches require strong title, artist, and duration agreement.
 - yt-dlp checks for updates at startup, once daily, and after recognized extractor failures.
