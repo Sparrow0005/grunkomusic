@@ -1755,6 +1755,17 @@ client.on('messageCreate', async (message) => {
     return logAndReply(message, '👋 **Grunko has left the stage:** voice disconnected and queue cleared.');
   }
 
+  if (command === 'clear') {
+    const state = guildQueues.get(message.guild.id);
+    if (!state?.songs.length) {
+      return logAndReply(message, '📜 **Grunko Queue:** no upcoming songs need clearing.');
+    }
+    const clearedCount = state.songs.length;
+    state.songs.length = 0;
+    return logAndReply(message,
+      `📜 **Grunko Queue cleared:** removed ${clearedCount} upcoming song${clearedCount === 1 ? '' : 's'}. The current song will keep playing.`);
+  }
+
   if (command === 'shuffle') {
     const state = guildQueues.get(message.guild.id);
     if (!state?.songs.length) return logAndReply(message, '📜 **Grunko Queue:** nothing is waiting to be shuffled.');
@@ -1808,6 +1819,7 @@ client.on('messageCreate', async (message) => {
       '**Shape the queue**\n' +
       '`-insert` / `-i` `<text or URL>` -- Put one YouTube song next in line\n' +
       '`-skip` / `-s` -- Move to the next song\n' +
+      '`-clear` -- Remove upcoming songs without stopping the current song\n' +
       '`-shuffle` -- Shuffle upcoming songs\n' +
       '`-queue` / `-q` -- Show upcoming songs\n\n' +
       '**Stage controls**\n' +

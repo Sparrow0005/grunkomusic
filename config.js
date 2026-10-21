@@ -22,5 +22,5 @@ module.exports = {
   ytdlpUpdateCooldown: 6 * 60 * 60 * 1000,
   maxQueueSize: 100,
   maxUploadSize: 25 * 1024 * 1024,
-  cookieWarningCooldown: 60 * 60 * 1000,
+  cookieWarningCooldown: 24 * 60 * 60 * 1000, // 24 hours
 };

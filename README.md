@@ -2,6 +2,8 @@
 
 Discord music bot for YouTube playback with Spotify and Apple Music metadata support. Audio is resolved through yt-dlp and transcoded through FFmpeg.
 
+[Terms of Service](TERMS_OF_SERVICE.md) | [Privacy Policy](PRIVACY_POLICY.md)
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -39,6 +41,7 @@ Administrator and moderation permissions are not required. Channel-specific over
 | `-fileplay` / `-fp` with an attachment or Discord attachment URL | Play one uploaded media file up to 25 MiB |
 | `-skip` / `-s` | Skip the current song |
 | `-leave` / `-l` | Disconnect and clear the server queue |
+| `-clear` | Clear upcoming songs while the current song keeps playing |
 | `-shuffle` | Shuffle upcoming songs |
 | `-queue` / `-q` | Show upcoming songs and durations |
 | `-playing` / `-np` | Show the current song and elapsed/total time |
