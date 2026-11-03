@@ -39,6 +39,24 @@ const playableAttachmentExtensions = new Set([
 const discordAttachmentHosts = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
 const maxCookieUploadSize = 2 * 1024 * 1024;
 
+function readTestingMode() {
+  try {
+    return JSON.parse(fs.readFileSync(config.botModeStatePath, 'utf8')).testing === true;
+  } catch {
+    return false;
+  }
+}
+
+let testingMode = readTestingMode();
+
+function writeTestingMode() {
+  try {
+    fs.writeFileSync(config.botModeStatePath, JSON.stringify({ testing: testingMode }, null, 2));
+  } catch (error) {
+    console.error('[MODE] Could not persist testing mode:', errorText(error));
+  }
+}
+
 function readLastYtdlpUpdateAttempt() {
   try {
     return JSON.parse(fs.readFileSync(config.maintenanceStatePath, 'utf8')).lastYtdlpUpdateAttempt || 0;
@@ -219,12 +237,36 @@ async function handleOwnerDm(message) {
     return message.reply(
       '🎛️ **Owner DM commands**\n' +
       '`cookies` + one attached Netscape cookie file -- replace and verify YouTube cookies\n' +
-      '`test` -- privately verify the installed cookies',
+      '`cookiecheck` -- privately verify the installed cookies\n' +
+      '`test` -- toggle owner-only testing mode',
     );
   }
-  if (command === 'test') return sendPrivateCookieTestResult(message);
+  if (command === 'test') {
+    testingMode = !testingMode;
+    writeTestingMode();
+    if (testingMode) {
+      await Promise.all([...guildQueues.entries()].map(async ([guildId, state]) => {
+        const activelyPlaying = state.playing && state.nowPlaying && state.current;
+        if (!activelyPlaying) return destroyQueue(guildId);
+        state.songs.length = 0;
+        state.leaveAfterCurrent = true;
+        await logAndSend(
+          state.textChannel,
+          `🧪 **Grunko is entering TESTING mode:** finishing **${state.nowPlaying.title}**, then leaving the voice channel.`,
+        );
+      }));
+    } else {
+      for (const state of guildQueues.values()) state.leaveAfterCurrent = false;
+    }
+    updateBotPresence();
+    console.log(`[MODE] Testing mode ${testingMode ? 'enabled' : 'disabled'} by the owner.`);
+    return message.reply(testingMode
+      ? '🧪 **TESTING mode enabled:** only Sparrow can use server commands or summon me. Active songs will finish before I leave; idle sessions were closed.'
+      : '🟢 **TESTING mode disabled:** normal public service is restored.');
+  }
+  if (command === 'cookiecheck' || command === 'checkcookies') return sendPrivateCookieTestResult(message);
   if (command !== 'cookies') {
-    return message.reply('🎛️ DM `cookies` with one Netscape-format cookie file attached, or say `test` to verify the installed file.');
+    return message.reply('🎛️ Say `test` to toggle testing mode, `cookiecheck` to verify cookies, or DM `cookies` with one Netscape-format cookie file attached.');
   }
   if (message.attachments.size !== 1) {
     return message.reply('⚠️ Attach exactly one Netscape-format cookie file to the `cookies` message.');
@@ -564,7 +606,9 @@ function updateBotPresence() {
     .filter((state) => state.nowPlaying)
     .sort((a, b) => (b.current?.startedAt || 0) - (a.current?.startedAt || 0));
   for (const state of activeStates) updateVoiceChannelStatus(state);
-  const serviceMode = cookieStatus() === 'active' ? 'full service' : 'public fallback';
+  const serviceMode = testingMode
+    ? 'TESTING'
+    : (cookieStatus() === 'active' ? 'full service' : 'public fallback');
   const healthText = `${serviceMode} • up ${formatUptime()}`;
   if (!activeStates.length) {
     client.user.setActivity(`${healthText} • -help`, { type: ActivityType.Listening });
@@ -1279,6 +1323,13 @@ function finishCurrent(guildId, generation = null) {
   state.current = null;
   state.playing = false;
   state.nowPlaying = null;
+  if (state.leaveAfterCurrent) {
+    console.log(`[MODE] Finished the active song in guild ${guildId}; leaving for testing mode.`);
+    setImmediate(() => destroyQueue(guildId).catch((error) => {
+      console.error('[MODE] Could not leave after the active song:', errorText(error));
+    }));
+    return;
+  }
   updateVoiceChannelStatus(state, true);
   updateBotPresence();
   setImmediate(() => playNext(guildId));
@@ -1316,7 +1367,7 @@ async function initializeQueue(message) {
   });
   state = {
     connection, player, songs: [], playing: false, nowPlaying: null,
-    current: null, textChannel: message.channel, idleTimer: null,
+    current: null, textChannel: message.channel, idleTimer: null, leaveAfterCurrent: false,
     voiceChannelId: voiceChannel.id, voiceStatusLastText: null, voiceStatusTarget: null,
     voiceStatusLastAttempt: 0, voiceStatusPromise: Promise.resolve(),
   };
@@ -1811,6 +1862,10 @@ client.on('messageCreate', async (message) => {
   const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const command = args.shift()?.toLowerCase();
 
+  // Testing mode is deliberately quiet for everyone except the configured
+  // owner, so public users cannot summon or control the bot while work is in progress.
+  if (testingMode && message.author.id !== config.ownerUserId) return;
+
   if (command === 'test') {
     if (message.author.id !== config.ownerUserId) return;
     return sendPrivateCookieTestResult(message);
@@ -1984,6 +2039,25 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: '⚠️ Grunko could not update that queue page.', ephemeral: true }).catch(() => {});
     }
   }
+});
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  // Ignore mute/deafen changes and the bot's own connection events. The voice
+  // connection handler already owns recovery when Discord moves or drops us.
+  if (oldState.channelId === newState.channelId || oldState.id === client.user?.id) return;
+
+  const guildId = oldState.guild.id;
+  const state = guildQueues.get(guildId);
+  if (!state || oldState.channelId !== state.voiceChannelId) return;
+
+  const voiceChannel = oldState.guild.channels.cache.get(state.voiceChannelId);
+  const hasHumanListener = voiceChannel?.members.some((member) => !member.user.bot);
+  if (hasHumanListener) return;
+
+  console.log(`[VOICE] No human listeners remain in ${voiceChannel?.name || state.voiceChannelId}; leaving immediately.`);
+  destroyQueue(guildId).catch((error) => {
+    console.error('[VOICE] Could not leave an empty voice channel:', errorText(error));
+  });
 });
 
 client.once('clientReady', () => {

@@ -65,6 +65,7 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 ## Status and privacy
 
 - Discord's native presence indicates whether the bot is online or offline. Its profile activity refreshes once per minute with `full service` or `public fallback`, uptime, and aggregate active-server count. It never exposes cookie details or listener identities.
+- The owner can DM `test` to toggle persistent testing mode. The profile displays `TESTING`, and only the configured owner can use server commands until testing mode is disabled. Idle voice sessions close immediately; an actively playing session announces the change, clears upcoming songs, finishes its current song, and then leaves.
 - Each active voice channel shows its own song and timestamp status.
 - `-playing` and `-queue` are isolated per server.
 - Voice-channel status is cleared when playback stops or the bot leaves.
@@ -76,12 +77,13 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 - Cookies that still receive an authentication challenge are marked unhealthy.
 - Cookie expiration is never announced in a server. After an authentication-related download failure, the bot privately DMs `@sparrow05` at most once every 24 hours.
 - Only the configured owner Discord ID can replace cookies by DM using `cookies` with one attached Netscape-format cookie file. A leading dash is optional in owner DMs. The file is validated before installation, immediately tested against an authentication-required YouTube video, and its contents are never logged.
-- The owner can say `test` in a DM or use `-test` in a server to run the same private cookie check. Server results are sent to the owner by DM.
+- The owner can say `cookiecheck` in a DM or use `-test` in a server to run the same private cookie check. Server results are sent to the owner by DM.
 - Unavailable playlist entries may be replaced only by a context-matched result.
 - Spotify and Apple Music matches require strong title, artist, and duration agreement.
 - yt-dlp checks for updates at startup, once daily, and after recognized extractor failures.
 - The watchdog restarts crashes with exponential backoff and rotates logs larger than 10 MB.
-- Empty voice sessions disconnect after 10 minutes.
+- The bot disconnects immediately and clears that server's queue when the last human listener leaves its voice channel.
+- When humans remain but playback is idle, the bot disconnects after 10 minutes.
 
 ## Local files
 
@@ -91,6 +93,7 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 | `token.txt` | Discord bot token | No |
 | `cookies.txt` | Optional YouTube login cookies | No |
 | `cookie-health.json` | Cookie rejection state | No |
+| `bot-mode.json` | Persistent owner-only testing-mode state | No |
 | `maintenance-state.json` | yt-dlp update cooldown state | No |
 | `bot.log` | Normal runtime log | No |
 | `bot-error.log` | Error and recovery log | No |

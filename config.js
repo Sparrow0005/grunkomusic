@@ -12,6 +12,7 @@ module.exports = {
   cookiesFilePath: path.join(scriptDirectory, 'cookies.txt'),
   maintenanceStatePath: path.join(scriptDirectory, 'maintenance-state.json'),
   cookieHealthStatePath: path.join(scriptDirectory, 'cookie-health.json'),
+  botModeStatePath: path.join(scriptDirectory, 'bot-mode.json'),
   // Age-restricted video used only to verify that YouTube accepts the saved cookies.
   cookieVerificationUrl: 'https://www.youtube.com/watch?v=6cUT0U1nBXE',
   inactivityTimeout: 10 * 60 * 1000, // 10 minutes
