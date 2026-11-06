@@ -69,6 +69,7 @@ Search selections accept `1` through `5`, or `x` to cancel. Queue displays use b
 - Each active voice channel shows its own song and timestamp status.
 - `-playing` and `-queue` are isolated per server.
 - Voice-channel status is cleared when playback stops or the bot leaves.
+- Automatic departures announce whether playback was idle or everyone left the voice channel.
 
 ## Recovery behavior
 

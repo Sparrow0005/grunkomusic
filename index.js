@@ -1233,10 +1233,25 @@ async function destroyQueue(guildId) {
   updateBotPresence();
 }
 
+async function announceAutomaticDisconnect(guildId, message, logLabel) {
+  const state = guildQueues.get(guildId);
+  if (!state || state.disconnectPending) return;
+  state.disconnectPending = true;
+  console.log(`[VOICE] ${logLabel}`);
+  await logAndSend(state.textChannel, message);
+  if (guildQueues.get(guildId) === state) await destroyQueue(guildId);
+}
+
 function scheduleDisconnect(guildId) {
   const state = guildQueues.get(guildId);
   if (!state || state.idleTimer) return;
-  state.idleTimer = setTimeout(() => destroyQueue(guildId), config.inactivityTimeout);
+  state.idleTimer = setTimeout(() => {
+    announceAutomaticDisconnect(
+      guildId,
+      '👋 **Grunko has left the stage:** playback was idle for 10 minutes.',
+      `Playback stayed idle for ${config.inactivityTimeout}ms; leaving.`,
+    ).catch((error) => console.error('[VOICE] Could not complete the idle disconnect:', errorText(error)));
+  }, config.inactivityTimeout);
 }
 
 async function playNext(guildId) {
@@ -2054,8 +2069,11 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   const hasHumanListener = voiceChannel?.members.some((member) => !member.user.bot);
   if (hasHumanListener) return;
 
-  console.log(`[VOICE] No human listeners remain in ${voiceChannel?.name || state.voiceChannelId}; leaving immediately.`);
-  destroyQueue(guildId).catch((error) => {
+  announceAutomaticDisconnect(
+    guildId,
+    '👋 **Grunko has left the stage:** everyone left the voice channel.',
+    `No human listeners remain in ${voiceChannel?.name || state.voiceChannelId}; leaving immediately.`,
+  ).catch((error) => {
     console.error('[VOICE] Could not leave an empty voice channel:', errorText(error));
   });
 });
