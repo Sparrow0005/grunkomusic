@@ -23,6 +23,10 @@ while ($true) {
   $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = 'cmd.exe'
   $startInfo.Arguments = "/d /s /c `"$command`""
+  # Scheduled tasks start under System32 unless an explicit child working
+  # directory is supplied. yt-dlp needs a writable current directory for
+  # temporary files, so keep the bot process inside its own repository.
+  $startInfo.WorkingDirectory = $repo
   $startInfo.UseShellExecute = $false
   $startInfo.CreateNoWindow = $true
   $process = [System.Diagnostics.Process]::new()
